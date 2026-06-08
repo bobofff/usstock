@@ -1,0 +1,2 @@
+"""News ingestion entry points."""
+

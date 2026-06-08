@@ -1,0 +1,2 @@
+"""Trend extraction entry points."""
+

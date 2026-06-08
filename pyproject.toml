@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usstock"
+version = "0.1.0"
+description = "Lightweight AI-assisted US stock research system."
+readme = "readme.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pandas>=3.0.3",
+    "lxml>=6.1.1",
+    "psycopg[binary]>=3.2.0",
+]
+
+[project.scripts]
+usstock = "usstock.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
