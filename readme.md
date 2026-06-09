@@ -303,6 +303,89 @@ usstock status
 
 数据库连接默认读取环境变量或 `.env` 中的 `DATABASE_URL`。
 
+### SEC EDGAR 接入
+
+SEC EDGAR 不需要 API key，但必须配置带联系信息的 `SEC_USER_AGENT`。
+
+```bash
+.venv/bin/python -m usstock.data.sec sync-registry
+.venv/bin/python -m usstock.data.sec sync-ticker AAPL --filing-limit 20
+.venv/bin/python -m usstock.data.sec sync-ticker AAPL --include-company-facts --filing-limit 20 --fact-limit 500
+```
+
+如果项目已安装为可执行命令，也可以使用：
+
+```bash
+usstock sec sync-registry
+usstock sec sync-ticker AAPL --filing-limit 20
+usstock sec sync-ticker AAPL --include-company-facts --filing-limit 20 --fact-limit 500
+```
+
+### GDELT DOC API 接入
+
+GDELT DOC API 不需要 API key。MVP 先使用 `artlist` 同步全球新闻文章列表，并用 `timelinevolraw` 保存主题热度原始时间线。
+
+```bash
+.venv/bin/python -m usstock.data.gdelt sync-articles '"artificial intelligence" semiconductor' --timespan 24h --max-records 50
+.venv/bin/python -m usstock.data.gdelt sync-timeline '"artificial intelligence" semiconductor' --timespan 24h
+.venv/bin/python -m usstock.data.gdelt sync-query '"artificial intelligence" semiconductor' --timespan 24h --max-records 50
+```
+
+如果项目已安装为可执行命令，也可以使用：
+
+```bash
+usstock gdelt sync-query '"artificial intelligence" semiconductor' --timespan 24h --max-records 50
+```
+
+### Finnhub News 接入
+
+Finnhub News 需要配置 `FINNHUB_API_KEY`。MVP 支持 market news 分类新闻和 company news 个股新闻，原始响应会落到 `finnhub_news_queries`，标准化文章会落到 `finnhub_articles`。
+
+```bash
+.venv/bin/python -m usstock.data.finnhub sync-market --category general
+.venv/bin/python -m usstock.data.finnhub sync-company AAPL --from-date 2026-06-01 --to-date 2026-06-09
+```
+
+如果项目已安装为可执行命令，也可以使用：
+
+```bash
+usstock finnhub sync-market --category general
+usstock finnhub sync-company AAPL --from-date 2026-06-01 --to-date 2026-06-09
+```
+
+### 本地管理面板
+
+项目提供一个自用的轻量本地面板，不依赖前端构建工具，默认只监听 `127.0.0.1`。
+
+```bash
+PYTHONPATH=src .venv/bin/python -m usstock.admin.app
+```
+
+如果默认端口被占用，可以显式指定端口：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m usstock.admin.app --port 7879
+```
+
+如果项目已安装为可执行命令，也可以使用：
+
+```bash
+usstock admin
+usstock admin --port 7879
+```
+
+默认访问地址：
+
+```text
+http://127.0.0.1:7878
+```
+
+第一版面板只覆盖最常用的内部操作：
+
+* 查看股票池、SEC 公告、GDELT 文章、Finnhub 新闻和最近迁移记录。
+* 手工新增或更新观察标的。
+* 触发 SEC 公司映射、单只 ticker、GDELT query 和 Finnhub News 同步。
+
 ### Phase 1：投研数据管道和日报
 
 目标周期：1-2 周

@@ -48,6 +48,18 @@ class Settings:
 
     database_url: str | None
     migrations_dir: Path
+    sec_user_agent: str | None
+    sec_rate_limit_per_second: float
+    sec_request_timeout_seconds: float
+    sec_base_url: str
+    sec_archives_base_url: str
+    gdelt_doc_base_url: str
+    gdelt_rate_limit_per_second: float
+    gdelt_request_timeout_seconds: float
+    finnhub_api_key: str | None
+    finnhub_base_url: str
+    finnhub_rate_limit_per_second: float
+    finnhub_request_timeout_seconds: float
 
 
 @lru_cache(maxsize=1)
@@ -60,6 +72,65 @@ def get_settings() -> Settings:
         or env_file_values.get("MIGRATIONS_DIR")
         or str(DEFAULT_MIGRATIONS_DIR)
     )
+    sec_user_agent = os.environ.get("SEC_USER_AGENT") or env_file_values.get(
+        "SEC_USER_AGENT"
+    )
+    sec_rate_limit_per_second = float(
+        os.environ.get("SEC_RATE_LIMIT_PER_SECOND")
+        or env_file_values.get("SEC_RATE_LIMIT_PER_SECOND")
+        or "5"
+    )
+    sec_request_timeout_seconds = float(
+        os.environ.get("SEC_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("SEC_REQUEST_TIMEOUT_SECONDS")
+        or "30"
+    )
+    sec_base_url = (
+        os.environ.get("SEC_BASE_URL")
+        or env_file_values.get("SEC_BASE_URL")
+        or "https://data.sec.gov"
+    ).rstrip("/")
+    sec_archives_base_url = (
+        os.environ.get("SEC_ARCHIVES_BASE_URL")
+        or env_file_values.get("SEC_ARCHIVES_BASE_URL")
+        or "https://www.sec.gov/Archives"
+    ).rstrip("/")
+    gdelt_doc_base_url = (
+        os.environ.get("GDELT_DOC_BASE_URL")
+        or env_file_values.get("GDELT_DOC_BASE_URL")
+        or "https://api.gdeltproject.org/api/v2/doc/doc"
+    )
+    gdelt_rate_limit_per_second = float(
+        os.environ.get("GDELT_RATE_LIMIT_PER_SECOND")
+        or env_file_values.get("GDELT_RATE_LIMIT_PER_SECOND")
+        or "0.2"
+    )
+    gdelt_request_timeout_seconds = float(
+        os.environ.get("GDELT_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("GDELT_REQUEST_TIMEOUT_SECONDS")
+        or "30"
+    )
+    finnhub_api_key = (
+        os.environ.get("FINNHUB_API_KEY")
+        or env_file_values.get("FINNHUB_API_KEY")
+        or os.environ.get("FINNHUB_TOKEN")
+        or env_file_values.get("FINNHUB_TOKEN")
+    )
+    finnhub_base_url = (
+        os.environ.get("FINNHUB_BASE_URL")
+        or env_file_values.get("FINNHUB_BASE_URL")
+        or "https://finnhub.io/api/v1"
+    ).rstrip("/")
+    finnhub_rate_limit_per_second = float(
+        os.environ.get("FINNHUB_RATE_LIMIT_PER_SECOND")
+        or env_file_values.get("FINNHUB_RATE_LIMIT_PER_SECOND")
+        or "1"
+    )
+    finnhub_request_timeout_seconds = float(
+        os.environ.get("FINNHUB_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("FINNHUB_REQUEST_TIMEOUT_SECONDS")
+        or "30"
+    )
 
     migrations_dir = Path(migrations_dir_value).expanduser()
     if not migrations_dir.is_absolute():
@@ -68,4 +139,16 @@ def get_settings() -> Settings:
     return Settings(
         database_url=database_url,
         migrations_dir=migrations_dir,
+        sec_user_agent=sec_user_agent,
+        sec_rate_limit_per_second=sec_rate_limit_per_second,
+        sec_request_timeout_seconds=sec_request_timeout_seconds,
+        sec_base_url=sec_base_url,
+        sec_archives_base_url=sec_archives_base_url,
+        gdelt_doc_base_url=gdelt_doc_base_url,
+        gdelt_rate_limit_per_second=gdelt_rate_limit_per_second,
+        gdelt_request_timeout_seconds=gdelt_request_timeout_seconds,
+        finnhub_api_key=finnhub_api_key,
+        finnhub_base_url=finnhub_base_url,
+        finnhub_rate_limit_per_second=finnhub_rate_limit_per_second,
+        finnhub_request_timeout_seconds=finnhub_request_timeout_seconds,
     )
