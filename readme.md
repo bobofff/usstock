@@ -353,6 +353,30 @@ usstock finnhub sync-market --category general
 usstock finnhub sync-company AAPL --from-date 2026-06-01 --to-date 2026-06-09
 ```
 
+### 自动热点发现和每日候选股
+
+自动发现流程会写入默认主题库，用主题库替代人工 GDELT query；同步 Finnhub market news 并抽取相关 ticker 和关键词；扫描股票池中的 SEC filings；最后生成每日候选股评分和观察清单。
+
+```bash
+usstock migrate
+usstock discover seed-topics
+usstock discover daily --top-n 25
+```
+
+如果只想用库内已有的 GDELT、Finnhub、SEC 数据重新评分，不触发外部请求：
+
+```bash
+usstock discover daily --skip-sync --top-n 25
+```
+
+如果需要让它按固定间隔循环执行，可以使用：
+
+```bash
+usstock discover loop --interval-minutes 60
+```
+
+默认配置会同步 Finnhub `general` 和 `merger` 两个 market news 分类；GDELT 会按主题库逐个同步；SEC 会扫描股票池中排序靠前的活跃标的。可以用 `--max-sec-tickers`、`--skip-gdelt-sync`、`--skip-finnhub-sync`、`--skip-sec-sync` 控制同步范围。
+
 ### 本地管理面板
 
 项目提供一个自用的轻量本地面板，不依赖前端构建工具，默认只监听 `127.0.0.1`。

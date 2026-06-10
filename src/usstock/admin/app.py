@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import html
 import sys
+import threading
 import traceback
 import urllib.parse
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
@@ -21,12 +23,140 @@ from psycopg.rows import dict_row
 from usstock.config.settings import get_settings
 from usstock.data import finnhub
 from usstock.data import gdelt, sec
+from usstock.discovery import daily as discovery
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 PAGE_SIZE = 100
 MAX_POST_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class DiscoveryRunConfig:
+    top_n: int
+    lookback_hours: int
+    gdelt_max_records: int
+    max_sec_tickers: int
+    sec_filing_limit: int
+    include_company_facts: bool
+    skip_finnhub_sync: bool
+    skip_gdelt_sync: bool
+    skip_sec_sync: bool
+
+
+class DiscoveryScheduler:
+    """Small in-process scheduler controlled from the local admin panel."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._interval_minutes: int | None = None
+        self._config: DiscoveryRunConfig | None = None
+        self._started_at: datetime | None = None
+        self._last_run_started_at: datetime | None = None
+        self._last_run_finished_at: datetime | None = None
+        self._last_message = "尚未启动。"
+        self._last_error: str | None = None
+        self._run_count = 0
+        self._is_running_once = False
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active": self._thread is not None and self._thread.is_alive(),
+                "interval_minutes": self._interval_minutes,
+                "config": self._config,
+                "started_at": self._started_at,
+                "last_run_started_at": self._last_run_started_at,
+                "last_run_finished_at": self._last_run_finished_at,
+                "last_message": self._last_message,
+                "last_error": self._last_error,
+                "run_count": self._run_count,
+                "is_running_once": self._is_running_once,
+            }
+
+    def start(
+        self,
+        *,
+        database_url: str,
+        interval_minutes: int,
+        config: DiscoveryRunConfig,
+    ) -> bool:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+
+            self._stop_event.clear()
+            self._interval_minutes = interval_minutes
+            self._config = config
+            self._started_at = datetime.now()
+            self._last_message = "定时任务已启动，正在等待首次运行。"
+            self._last_error = None
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                args=(database_url, interval_minutes, config),
+                daemon=True,
+                name="usstock-discovery-scheduler",
+            )
+            self._thread.start()
+            return True
+
+    def stop(self) -> bool:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._last_message = "定时任务当前未运行。"
+                return False
+
+            self._stop_event.set()
+            self._last_message = "已请求停止定时任务。"
+            return True
+
+    def _run_loop(
+        self,
+        database_url: str,
+        interval_minutes: int,
+        config: DiscoveryRunConfig,
+    ) -> None:
+        try:
+            while not self._stop_event.is_set():
+                self._run_once(database_url, config)
+                if self._stop_event.wait(max(1, interval_minutes) * 60):
+                    break
+        finally:
+            with self._lock:
+                self._thread = None
+                if self._last_message == "已请求停止定时任务。":
+                    self._last_message = "定时任务已停止。"
+
+    def _run_once(self, database_url: str, config: DiscoveryRunConfig) -> None:
+        with self._lock:
+            self._is_running_once = True
+            self._last_run_started_at = datetime.now()
+            self._last_error = None
+
+        try:
+            result = run_discovery_daily(database_url, config)
+            message = (
+                f"{result.run_date.isoformat()} 自动发现完成："
+                f"候选 {len(result.candidates)} 个，"
+                f"警告 {len(result.warnings)} 条。"
+            )
+            with self._lock:
+                self._run_count += 1
+                self._last_message = message
+        except Exception as exc:  # pragma: no cover - background safety net.
+            with self._lock:
+                self._last_error = str(exc)
+                self._last_message = f"自动发现失败：{exc}"
+        finally:
+            with self._lock:
+                self._last_run_finished_at = datetime.now()
+                self._is_running_once = False
+
+
+DISCOVERY_SCHEDULER = DiscoveryScheduler()
 
 
 class AdminPanelError(RuntimeError):
@@ -64,6 +194,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "/sec": render_sec_filings,
             "/gdelt": render_gdelt,
             "/finnhub": render_finnhub,
+            "/topics": render_topics,
             "/tasks": render_tasks,
         }
         renderer = routes.get(parsed.path)
@@ -193,6 +324,50 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path == "/actions/discovery-daily":
+                config = parse_discovery_run_config(form)
+                result = run_discovery_daily(database_url, config)
+                self.redirect(
+                    "/tasks",
+                    (
+                        "自动热点发现完成："
+                        f"候选={len(result.candidates)}，"
+                        f"警告={len(result.warnings)}。"
+                    ),
+                    ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/discovery-schedule-start":
+                config = parse_discovery_run_config(form)
+                interval_minutes = (
+                    parse_positive_int(form_value(form, "interval_minutes")) or 60
+                )
+                started = DISCOVERY_SCHEDULER.start(
+                    database_url=get_database_url(database_url),
+                    interval_minutes=interval_minutes,
+                    config=config,
+                )
+                self.redirect(
+                    "/tasks",
+                    (
+                        f"自动发现定时任务已启动，每 {interval_minutes} 分钟运行一次。"
+                        if started
+                        else "自动发现定时任务已经在运行。"
+                    ),
+                    ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/discovery-schedule-stop":
+                stopped = DISCOVERY_SCHEDULER.stop()
+                self.redirect(
+                    "/tasks",
+                    "已请求停止自动发现定时任务。" if stopped else "自动发现定时任务当前未运行。",
+                    ok=True,
+                )
+                return
+
             self.redirect("/tasks", "未知操作。", ok=False)
         except Exception as exc:  # pragma: no cover - keeps the panel usable.
             traceback.print_exc()
@@ -276,6 +451,8 @@ def render_dashboard(
                 "gdelt_doc_queries": table_exists(conn, "gdelt_doc_queries"),
                 "finnhub_articles": table_exists(conn, "finnhub_articles"),
                 "finnhub_news_queries": table_exists(conn, "finnhub_news_queries"),
+                "market_topics": table_exists(conn, "market_topics"),
+                "topic_mentions": table_exists(conn, "topic_mentions"),
                 "schema_migrations": table_exists(conn, "schema_migrations"),
             }
             stock_summary = (
@@ -353,6 +530,34 @@ def render_dashboard(
             finnhub_query_summary = (
                 fetch_one(conn, "SELECT count(*) AS total FROM finnhub_news_queries")
                 if tables["finnhub_news_queries"]
+                else {}
+            )
+            topic_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE is_active) AS active
+                    FROM market_topics
+                    """,
+                )
+                if tables["market_topics"]
+                else {}
+            )
+            topic_mention_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (
+                            WHERE detected_at >= now() - interval '24 hours'
+                        ) AS recent
+                    FROM topic_mentions
+                    """,
+                )
+                if tables["topic_mentions"]
                 else {}
             )
             migrations = (
@@ -439,6 +644,11 @@ def render_dashboard(
             "Finnhub 查询",
             finnhub_query_summary.get("total"),
             "market / company",
+        ),
+        metric_box(
+            "主题",
+            topic_summary.get("total"),
+            f"启用 {fmt(topic_summary.get('active'))} / 24h 提及 {fmt(topic_mention_summary.get('recent'))}",
         ),
     ]
 
@@ -898,6 +1108,244 @@ def render_finnhub(
     return layout("Finnhub", body, active="/finnhub", query=query)
 
 
+def render_topics(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+) -> str:
+    topic_filter = form_value(query, "topic")
+    ticker_filter = form_value(query, "ticker").upper()
+
+    try:
+        with connect_database(database_url) as conn:
+            has_topics = table_exists(conn, "market_topics")
+            has_mentions = table_exists(conn, "topic_mentions")
+            has_scores = table_exists(conn, "daily_candidate_scores")
+
+            summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE is_active) AS active,
+                        max(last_refreshed_at) AS last_refreshed_at
+                    FROM market_topics
+                    """,
+                )
+                if has_topics
+                else {}
+            )
+            mention_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (
+                            WHERE detected_at >= now() - interval '24 hours'
+                        ) AS recent,
+                        count(DISTINCT ticker) FILTER (WHERE ticker IS NOT NULL) AS tickers,
+                        max(detected_at) AS last_detected_at
+                    FROM topic_mentions
+                    """,
+                )
+                if has_mentions
+                else {}
+            )
+            candidate_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE run_date = current_date) AS today,
+                        max(run_date) AS last_run_date
+                    FROM daily_candidate_scores
+                    """,
+                )
+                if has_scores
+                else {}
+            )
+
+            if has_topics and has_mentions:
+                topic_rows = fetch_all(
+                    conn,
+                    """
+                    SELECT
+                        mt.topic_slug,
+                        mt.topic_name,
+                        mt.gdelt_query,
+                        mt.keywords,
+                        mt.ticker_hints,
+                        mt.priority,
+                        mt.is_active,
+                        mt.last_refreshed_at,
+                        count(tm.id) AS mention_count,
+                        count(tm.id) FILTER (
+                            WHERE tm.detected_at >= now() - interval '24 hours'
+                        ) AS recent_mentions,
+                        count(DISTINCT tm.ticker) FILTER (
+                            WHERE tm.ticker IS NOT NULL
+                        ) AS ticker_count,
+                        max(tm.detected_at) AS last_detected_at
+                    FROM market_topics mt
+                    LEFT JOIN topic_mentions tm
+                      ON tm.topic_slug = mt.topic_slug
+                    GROUP BY mt.topic_slug, mt.topic_name, mt.gdelt_query,
+                             mt.keywords, mt.ticker_hints, mt.priority,
+                             mt.is_active, mt.last_refreshed_at
+                    ORDER BY mt.is_active DESC, mt.priority, mt.topic_slug
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+            elif has_topics:
+                topic_rows = fetch_all(
+                    conn,
+                    """
+                    SELECT
+                        topic_slug,
+                        topic_name,
+                        gdelt_query,
+                        keywords,
+                        ticker_hints,
+                        priority,
+                        is_active,
+                        last_refreshed_at,
+                        0 AS mention_count,
+                        0 AS recent_mentions,
+                        0 AS ticker_count,
+                        NULL AS last_detected_at
+                    FROM market_topics
+                    ORDER BY is_active DESC, priority, topic_slug
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+            else:
+                topic_rows = []
+
+            mention_conditions: list[str] = []
+            mention_params: list[Any] = []
+            if topic_filter:
+                mention_conditions.append("topic_slug = %s")
+                mention_params.append(topic_filter)
+            if ticker_filter:
+                mention_conditions.append("upper(coalesce(ticker, '')) = upper(%s)")
+                mention_params.append(ticker_filter)
+            mention_where = (
+                f"WHERE {' AND '.join(mention_conditions)}"
+                if mention_conditions
+                else ""
+            )
+            mention_rows = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT topic_slug, ticker, source_type, source_title,
+                           source_url, published_at, relevance_score, detected_at
+                    FROM topic_mentions
+                    {mention_where}
+                    ORDER BY detected_at DESC
+                    LIMIT %s
+                    """,
+                    (*mention_params, PAGE_SIZE),
+                )
+                if has_mentions
+                else []
+            )
+
+            score_conditions: list[str] = []
+            score_params: list[Any] = []
+            if topic_filter:
+                score_conditions.append("%s = ANY(topic_slugs)")
+                score_params.append(topic_filter)
+            if ticker_filter:
+                score_conditions.append("upper(ticker) = upper(%s)")
+                score_params.append(ticker_filter)
+            score_where = (
+                f"WHERE {' AND '.join(score_conditions)}" if score_conditions else ""
+            )
+            score_rows = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT run_date, rank, ticker, company_name, score,
+                           action_bias, primary_topic_slug, topic_slugs,
+                           finnhub_article_count, gdelt_article_count,
+                           sec_filing_count
+                    FROM daily_candidate_scores
+                    {score_where}
+                    ORDER BY run_date DESC, rank NULLS LAST, score DESC
+                    LIMIT %s
+                    """,
+                    (*score_params, PAGE_SIZE),
+                )
+                if has_scores
+                else []
+            )
+    except Exception as exc:
+        return render_database_error(exc, active="/topics")
+
+    metrics = [
+        metric_box(
+            "主题库",
+            summary.get("total"),
+            f"启用 {fmt(summary.get('active'))}",
+        ),
+        metric_box(
+            "主题提及",
+            mention_summary.get("total"),
+            f"近 24 小时 {fmt(mention_summary.get('recent'))}",
+        ),
+        metric_box(
+            "关联标的",
+            mention_summary.get("tickers"),
+            f"最近 {fmt(mention_summary.get('last_detected_at'))}",
+        ),
+        metric_box(
+            "候选评分",
+            candidate_summary.get("total"),
+            f"今日 {fmt(candidate_summary.get('today'))}",
+        ),
+    ]
+    migration_hint = ""
+    if not summary:
+        migration_hint = """
+        <section>
+          <div class="empty">暂无主题数据。请先执行数据库迁移，并在同步页运行自动热点发现。</div>
+        </section>
+        """
+
+    body = f"""
+    <section class="toolbar">
+      <h1>主题</h1>
+      <form method="get" class="filters">
+        <input name="topic" value="{e(topic_filter)}" placeholder="topic_slug">
+        <input name="ticker" value="{e(ticker_filter)}" placeholder="ticker">
+        <button type="submit">筛选</button>
+        <a class="button primary" href="/tasks">运行自动发现</a>
+      </form>
+    </section>
+    <section class="metrics">{"".join(metrics)}</section>
+    {migration_hint}
+    <section>
+      <h2>主题库</h2>
+      {render_topics_table(topic_rows)}
+    </section>
+    <section>
+      <h2>最近主题提及</h2>
+      {render_topic_mentions_table(mention_rows)}
+    </section>
+    <section>
+      <h2>每日候选评分</h2>
+      {render_candidate_scores_table(score_rows)}
+    </section>
+    """
+    return layout("主题", body, active="/topics", query=query)
+
+
 def render_tasks(
     *,
     database_url: str | None,
@@ -905,11 +1353,34 @@ def render_tasks(
 ) -> str:
     today = date.today()
     week_ago = today - timedelta(days=finnhub.DEFAULT_COMPANY_NEWS_DAYS)
+    discovery_status = render_discovery_scheduler_status(
+        DISCOVERY_SCHEDULER.snapshot()
+    )
     body = f"""
     <section class="toolbar">
       <h1>同步任务</h1>
     </section>
+    {discovery_status}
     <section class="task-grid">
+      <form method="post" action="/actions/discovery-daily">
+        <h2>自动热点发现</h2>
+        <p>按主题库同步 GDELT，拉取 Finnhub 市场新闻，扫描 SEC filings，并生成每日候选股评分。</p>
+        <label>候选数量 <input name="top_n" type="number" min="1" value="{discovery.DEFAULT_TOP_N}"></label>
+        <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{discovery.DEFAULT_LOOKBACK_HOURS}"></label>
+        <label>GDELT 文章数 <input name="gdelt_max_records" type="number" min="1" max="250" value="{gdelt.DEFAULT_MAX_RECORDS}"></label>
+        <label>SEC 扫描标的数 <input name="max_sec_tickers" type="number" min="1" value="{discovery.DEFAULT_MAX_SEC_TICKERS}"></label>
+        <label>SEC filing 数量 <input name="sec_filing_limit" type="number" min="1" value="{discovery.DEFAULT_SEC_FILING_LIMIT}"></label>
+        <label>定时间隔分钟 <input name="interval_minutes" type="number" min="1" value="60"></label>
+        <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
+        <label><input type="checkbox" name="skip_finnhub_sync" value="1"> 跳过 Finnhub</label>
+        <label><input type="checkbox" name="skip_gdelt_sync" value="1"> 跳过 GDELT</label>
+        <label><input type="checkbox" name="skip_sec_sync" value="1"> 跳过 SEC</label>
+        <div class="button-row">
+          <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
+          <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
+          <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
+        </div>
+      </form>
       <form method="post" action="/actions/sec-registry">
         <h2>SEC 公司映射</h2>
         <p>刷新 SEC ticker / CIK 映射，并回填股票池里的 CIK。</p>
@@ -947,6 +1418,93 @@ def render_tasks(
     </section>
     """
     return layout("同步任务", body, active="/tasks", query=query)
+
+
+def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
+    active = bool(snapshot.get("active"))
+    badge = (
+        '<span class="badge ok">定时运行中</span>'
+        if active
+        else '<span class="badge muted">定时未运行</span>'
+    )
+    running_once = (
+        '<span class="badge watch">本轮执行中</span>'
+        if snapshot.get("is_running_once")
+        else ""
+    )
+    error = snapshot.get("last_error")
+    error_html = f'<p class="error-text">{e(error)}</p>' if error else ""
+    config = snapshot.get("config")
+    config_hint = ""
+    if config:
+        config_hint = (
+            f"top_n={config.top_n}，"
+            f"回看={config.lookback_hours}h，"
+            f"SEC={config.max_sec_tickers} 个标的"
+        )
+
+    return f"""
+    <section>
+      <div class="toolbar">
+        <h2>自动发现定时任务</h2>
+        <div>{badge} {running_once}</div>
+      </div>
+      <div class="metrics">
+        {metric_box("运行次数", snapshot.get("run_count"), "本次面板进程内")}
+        {metric_box("间隔分钟", snapshot.get("interval_minutes"), config_hint or "未设置")}
+        {metric_box("上次开始", snapshot.get("last_run_started_at"), "自动发现")}
+        {metric_box("上次完成", snapshot.get("last_run_finished_at"), "自动发现")}
+      </div>
+      <p class="subtle">{e(snapshot.get("last_message"))}</p>
+      {error_html}
+    </section>
+    """
+
+
+def parse_discovery_run_config(
+    form: Mapping[str, list[str]],
+) -> DiscoveryRunConfig:
+    return DiscoveryRunConfig(
+        top_n=parse_positive_int(form_value(form, "top_n")) or discovery.DEFAULT_TOP_N,
+        lookback_hours=(
+            parse_positive_int(form_value(form, "lookback_hours"))
+            or discovery.DEFAULT_LOOKBACK_HOURS
+        ),
+        gdelt_max_records=(
+            parse_positive_int(form_value(form, "gdelt_max_records"))
+            or gdelt.DEFAULT_MAX_RECORDS
+        ),
+        max_sec_tickers=(
+            parse_positive_int(form_value(form, "max_sec_tickers"))
+            or discovery.DEFAULT_MAX_SEC_TICKERS
+        ),
+        sec_filing_limit=(
+            parse_positive_int(form_value(form, "sec_filing_limit"))
+            or discovery.DEFAULT_SEC_FILING_LIMIT
+        ),
+        include_company_facts=form_bool(form, "include_company_facts"),
+        skip_finnhub_sync=form_bool(form, "skip_finnhub_sync"),
+        skip_gdelt_sync=form_bool(form, "skip_gdelt_sync"),
+        skip_sec_sync=form_bool(form, "skip_sec_sync"),
+    )
+
+
+def run_discovery_daily(
+    database_url: str | None,
+    config: DiscoveryRunConfig,
+) -> discovery.DailyDiscoveryResult:
+    return discovery.run_daily_discovery(
+        database_url=database_url,
+        top_n=config.top_n,
+        lookback_hours=config.lookback_hours,
+        gdelt_max_records=config.gdelt_max_records,
+        max_sec_tickers=config.max_sec_tickers,
+        sec_filing_limit=config.sec_filing_limit,
+        include_company_facts=config.include_company_facts,
+        skip_finnhub_sync=config.skip_finnhub_sync,
+        skip_gdelt_sync=config.skip_gdelt_sync,
+        skip_sec_sync=config.skip_sec_sync,
+    )
 
 
 def upsert_stock(database_url: str | None, form: Mapping[str, list[str]]) -> str:
@@ -1162,6 +1720,108 @@ def render_finnhub_articles_table(
     return table(head, "".join(body))
 
 
+def render_topics_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无主题库记录。")
+
+    body = []
+    for row in rows:
+        status = (
+            '<span class="badge ok">启用</span>'
+            if row.get("is_active")
+            else '<span class="badge muted">停用</span>'
+        )
+        body.append(
+            f"""
+            <tr>
+              <td>
+                <strong>{e(row.get("topic_slug"))}</strong>
+                <div class="subtle">{e(row.get("topic_name"))}</div>
+              </td>
+              <td>{status}</td>
+              <td>{fmt(row.get("priority"))}</td>
+              <td>{e(clip_text(row.get("gdelt_query") or "", 140))}</td>
+              <td>{format_list(row.get("keywords"), limit=8)}</td>
+              <td>{format_list(row.get("ticker_hints"), limit=8)}</td>
+              <td>{fmt(row.get("recent_mentions"))}</td>
+              <td>{fmt(row.get("ticker_count"))}</td>
+              <td>{fmt(row.get("last_detected_at") or row.get("last_refreshed_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>主题</th><th>状态</th><th>优先级</th><th>GDELT query</th>"
+            "<th>关键词</th><th>种子标的</th><th>24h 提及</th>"
+            "<th>标的数</th><th>最近时间</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_topic_mentions_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无主题提及。")
+
+    body = []
+    for row in rows:
+        title = e(row.get("source_title"))
+        if row.get("source_url"):
+            title = f'<a href="{e(row.get("source_url"))}" target="_blank" rel="noreferrer">{title}</a>'
+        body.append(
+            f"""
+            <tr>
+              <td><strong>{e(row.get("topic_slug"))}</strong></td>
+              <td>{e(row.get("ticker"))}</td>
+              <td>{e(row.get("source_type"))}</td>
+              <td>{title}</td>
+              <td>{fmt(row.get("relevance_score"))}</td>
+              <td>{fmt(row.get("published_at"))}</td>
+              <td>{fmt(row.get("detected_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>主题</th><th>ticker</th><th>来源</th><th>标题</th>"
+            "<th>相关性</th><th>发布时间</th><th>检测时间</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无每日候选评分。")
+
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td>{fmt(row.get("run_date"))}</td>
+              <td>{fmt(row.get("rank"))}</td>
+              <td><strong>{e(row.get("ticker"))}</strong><div class="subtle">{e(row.get("company_name"))}</div></td>
+              <td>{fmt(row.get("score"))}</td>
+              <td>{e(row.get("action_bias"))}</td>
+              <td>{e(row.get("primary_topic_slug"))}</td>
+              <td>{format_list(row.get("topic_slugs"), limit=5)}</td>
+              <td>{fmt(row.get("finnhub_article_count"))}</td>
+              <td>{fmt(row.get("gdelt_article_count"))}</td>
+              <td>{fmt(row.get("sec_filing_count"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>日期</th><th>排名</th><th>ticker</th><th>评分</th>"
+            "<th>动作</th><th>主主题</th><th>主题</th>"
+            "<th>Finnhub</th><th>GDELT</th><th>SEC</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
 def format_ticker_list(value: Any) -> str:
     if not value:
         return "-"
@@ -1173,6 +1833,21 @@ def format_ticker_list(value: Any) -> str:
     if not tickers:
         return "-"
     return e(", ".join(tickers[:8]))
+
+
+def format_list(value: Any, *, limit: int = 8) -> str:
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list | tuple):
+        items = [str(item).strip() for item in value]
+    else:
+        items = []
+    items = [item for item in items if item]
+    if not items:
+        return "-"
+    clipped = items[:limit]
+    suffix = f" +{len(items) - limit}" if len(items) > limit else ""
+    return e(", ".join(clipped) + suffix)
 
 
 def render_finnhub_breakdown_table(
@@ -1330,6 +2005,7 @@ def layout(
         ("/sec", "SEC"),
         ("/gdelt", "GDELT"),
         ("/finnhub", "Finnhub"),
+        ("/topics", "主题"),
         ("/tasks", "同步"),
     ]
     nav = "".join(
@@ -1465,6 +2141,11 @@ def layout(
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
+    }}
+    .button-row {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
     }}
     .filters {{
       display: flex;

@@ -9,6 +9,7 @@ from usstock.data import finnhub
 from usstock.data import gdelt
 from usstock.data import sec
 from usstock.db.migrations import main as migrations_main
+from usstock.discovery import daily as discovery
 
 
 def main() -> int:
@@ -21,6 +22,8 @@ def main() -> int:
         return gdelt.main(argv[1:])
     if argv and argv[0] == "finnhub":
         return finnhub.main(argv[1:])
+    if argv and argv[0] == "discover":
+        return discovery.main(argv[1:])
 
     return migrations_main(argv)
 
