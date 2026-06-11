@@ -24,12 +24,16 @@ from usstock.config.settings import get_settings
 from usstock.data import finnhub
 from usstock.data import gdelt, sec
 from usstock.discovery import daily as discovery
+from usstock.discovery import topic_candidates
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 PAGE_SIZE = 100
 MAX_POST_BYTES = 64 * 1024
+PICO_CSS_URL = "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+HTMX_JS_URL = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
+ALPINE_JS_URL = "https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,13 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
 
+        if parsed.path == "/partials/discovery-status":
+            self.send_html(
+                HTTPStatus.OK,
+                render_discovery_scheduler_status(DISCOVERY_SCHEDULER.snapshot()),
+            )
+            return
+
         routes = {
             "/": render_dashboard,
             "/stocks": render_stocks,
@@ -338,6 +349,32 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path == "/actions/topic-extract":
+                result = topic_candidates.run_topic_extraction(
+                    database_url=database_url,
+                    lookback_hours=(
+                        parse_positive_int(form_value(form, "lookback_hours"))
+                        or topic_candidates.DEFAULT_TOPIC_EXTRACTION_LOOKBACK_HOURS
+                    ),
+                    max_candidates=(
+                        parse_positive_int(form_value(form, "max_candidates"))
+                        or topic_candidates.DEFAULT_MAX_CANDIDATES
+                    ),
+                    min_articles=(
+                        parse_positive_int(form_value(form, "min_articles"))
+                        or topic_candidates.DEFAULT_MIN_ARTICLES
+                    ),
+                    min_score=form_value(form, "min_score")
+                    or str(topic_candidates.DEFAULT_MIN_SCORE),
+                    include_existing_matches=form_bool(form, "include_existing_matches"),
+                )
+                self.redirect(
+                    "/topics",
+                    f"候选主题抽取完成：新增或刷新 {len(result.candidates)} 个候选主题。",
+                    ok=True,
+                )
+                return
+
             if parsed.path == "/actions/discovery-schedule-start":
                 config = parse_discovery_run_config(form)
                 interval_minutes = (
@@ -452,6 +489,7 @@ def render_dashboard(
                 "finnhub_articles": table_exists(conn, "finnhub_articles"),
                 "finnhub_news_queries": table_exists(conn, "finnhub_news_queries"),
                 "market_topics": table_exists(conn, "market_topics"),
+                "market_topic_candidates": table_exists(conn, "market_topic_candidates"),
                 "topic_mentions": table_exists(conn, "topic_mentions"),
                 "schema_migrations": table_exists(conn, "schema_migrations"),
             }
@@ -560,6 +598,23 @@ def render_dashboard(
                 if tables["topic_mentions"]
                 else {}
             )
+            topic_candidate_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE status = 'pending') AS pending,
+                        count(*) FILTER (
+                            WHERE last_seen_at >= now() - interval '24 hours'
+                        ) AS recent,
+                        max(last_seen_at) AS last_seen_at
+                    FROM market_topic_candidates
+                    """,
+                )
+                if tables["market_topic_candidates"]
+                else {}
+            )
             migrations = (
                 fetch_all(
                     conn,
@@ -649,6 +704,11 @@ def render_dashboard(
             "主题",
             topic_summary.get("total"),
             f"启用 {fmt(topic_summary.get('active'))} / 24h 提及 {fmt(topic_mention_summary.get('recent'))}",
+        ),
+        metric_box(
+            "候选主题",
+            topic_candidate_summary.get("total"),
+            f"待审核 {fmt(topic_candidate_summary.get('pending'))} / 24h {fmt(topic_candidate_summary.get('recent'))}",
         ),
     ]
 
@@ -1115,10 +1175,12 @@ def render_topics(
 ) -> str:
     topic_filter = form_value(query, "topic")
     ticker_filter = form_value(query, "ticker").upper()
+    candidate_status_filter = form_value(query, "candidate_status")
 
     try:
         with connect_database(database_url) as conn:
             has_topics = table_exists(conn, "market_topics")
+            has_topic_candidates = table_exists(conn, "market_topic_candidates")
             has_mentions = table_exists(conn, "topic_mentions")
             has_scores = table_exists(conn, "daily_candidate_scores")
 
@@ -1165,6 +1227,25 @@ def render_topics(
                     """,
                 )
                 if has_scores
+                else {}
+            )
+            topic_candidate_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE status = 'pending') AS pending,
+                        count(*) FILTER (WHERE status = 'promoted') AS promoted,
+                        count(*) FILTER (WHERE status IN ('rejected', 'ignored')) AS closed,
+                        count(*) FILTER (
+                            WHERE last_seen_at >= now() - interval '24 hours'
+                        ) AS recent,
+                        max(last_seen_at) AS last_seen_at
+                    FROM market_topic_candidates
+                    """,
+                )
+                if has_topic_candidates
                 else {}
             )
 
@@ -1225,6 +1306,56 @@ def render_topics(
                 )
             else:
                 topic_rows = []
+
+            candidate_conditions: list[str] = []
+            candidate_params: list[Any] = []
+            if candidate_status_filter:
+                candidate_conditions.append("status = %s")
+                candidate_params.append(candidate_status_filter)
+            if topic_filter:
+                candidate_conditions.append(
+                    """
+                    (
+                        candidate_slug ILIKE %s
+                        OR coalesce(matched_topic_slug, '') = %s
+                        OR %s = ANY(keywords)
+                    )
+                    """
+                )
+                candidate_params.extend([f"%{topic_filter}%", topic_filter, topic_filter])
+            if ticker_filter:
+                candidate_conditions.append("%s = ANY(ticker_hints)")
+                candidate_params.append(ticker_filter)
+            candidate_where = (
+                f"WHERE {' AND '.join(candidate_conditions)}"
+                if candidate_conditions
+                else ""
+            )
+            topic_candidate_rows = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT candidate_slug, topic_name, gdelt_query, keywords,
+                           ticker_hints, source_types, article_count, source_count,
+                           ticker_count, trend_score, novelty_score, status,
+                           matched_topic_slug, evidence, last_seen_at
+                    FROM market_topic_candidates
+                    {candidate_where}
+                    ORDER BY
+                        CASE status
+                            WHEN 'pending' THEN 0
+                            WHEN 'promoted' THEN 1
+                            ELSE 2
+                        END,
+                        trend_score DESC,
+                        last_seen_at DESC
+                    LIMIT %s
+                    """,
+                    (*candidate_params, PAGE_SIZE),
+                )
+                if has_topic_candidates
+                else []
+            )
 
             mention_conditions: list[str] = []
             mention_params: list[Any] = []
@@ -1300,6 +1431,11 @@ def render_topics(
             f"近 24 小时 {fmt(mention_summary.get('recent'))}",
         ),
         metric_box(
+            "候选主题",
+            topic_candidate_summary.get("total"),
+            f"待审核 {fmt(topic_candidate_summary.get('pending'))} / 已晋升 {fmt(topic_candidate_summary.get('promoted'))}",
+        ),
+        metric_box(
             "关联标的",
             mention_summary.get("tickers"),
             f"最近 {fmt(mention_summary.get('last_detected_at'))}",
@@ -1311,7 +1447,7 @@ def render_topics(
         ),
     ]
     migration_hint = ""
-    if not summary:
+    if not summary and not topic_candidate_summary:
         migration_hint = """
         <section>
           <div class="empty">暂无主题数据。请先执行数据库迁移，并在同步页运行自动热点发现。</div>
@@ -1324,6 +1460,9 @@ def render_topics(
       <form method="get" class="filters">
         <input name="topic" value="{e(topic_filter)}" placeholder="topic_slug">
         <input name="ticker" value="{e(ticker_filter)}" placeholder="ticker">
+        <select name="candidate_status">
+          {render_candidate_status_options(candidate_status_filter)}
+        </select>
         <button type="submit">筛选</button>
         <a class="button primary" href="/tasks">运行自动发现</a>
       </form>
@@ -1333,6 +1472,10 @@ def render_topics(
     <section>
       <h2>主题库</h2>
       {render_topics_table(topic_rows)}
+    </section>
+    <section>
+      <h2>新闻候选主题</h2>
+      {render_topic_candidates_table(topic_candidate_rows)}
     </section>
     <section>
       <h2>最近主题提及</h2>
@@ -1380,6 +1523,16 @@ def render_tasks(
           <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
           <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
         </div>
+      </form>
+      <form method="post" action="/actions/topic-extract">
+        <h2>新闻候选主题</h2>
+        <p>从已入库的 Finnhub 和 GDELT 新闻中抽取候选主题，先进入候选表等待审核。</p>
+        <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{topic_candidates.DEFAULT_TOPIC_EXTRACTION_LOOKBACK_HOURS}"></label>
+        <label>候选数量 <input name="max_candidates" type="number" min="1" value="{topic_candidates.DEFAULT_MAX_CANDIDATES}"></label>
+        <label>最少文章数 <input name="min_articles" type="number" min="1" value="{topic_candidates.DEFAULT_MIN_ARTICLES}"></label>
+        <label>最低分数 <input name="min_score" type="number" min="0" step="0.1" value="{topic_candidates.DEFAULT_MIN_SCORE}"></label>
+        <label><input type="checkbox" name="include_existing_matches" value="1"> 保留已匹配正式主题的候选</label>
+        <button class="primary" type="submit">抽取候选主题</button>
       </form>
       <form method="post" action="/actions/sec-registry">
         <h2>SEC 公司映射</h2>
@@ -1444,7 +1597,7 @@ def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
         )
 
     return f"""
-    <section>
+    <section class="status-panel" hx-get="/partials/discovery-status" hx-trigger="every 10s" hx-target="this" hx-select=".status-panel" hx-swap="outerHTML">
       <div class="toolbar">
         <h2>自动发现定时任务</h2>
         <div>{badge} {running_once}</div>
@@ -1759,6 +1912,102 @@ def render_topics_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def render_candidate_status_options(selected: str) -> str:
+    options = [
+        ("", "全部候选状态"),
+        ("pending", "待审核"),
+        ("promoted", "已晋升"),
+        ("rejected", "已拒绝"),
+        ("ignored", "已忽略"),
+    ]
+    return "".join(
+        (
+            f'<option value="{e(value)}"'
+            f'{" selected" if value == selected else ""}>{e(label)}</option>'
+        )
+        for value, label in options
+    )
+
+
+def render_topic_candidates_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无新闻候选主题。可以在同步页运行候选主题抽取。")
+
+    body = []
+    for row in rows:
+        status = render_topic_candidate_status(row.get("status"))
+        coverage = (
+            f"文章 {fmt(row.get('article_count'))}"
+            f"<br>来源 {fmt(row.get('source_count'))}"
+            f"<br>标的 {fmt(row.get('ticker_count'))}"
+        )
+        score = (
+            f"<strong>{fmt(row.get('trend_score'))}</strong>"
+            f"<div class=\"subtle\">新颖 {fmt(row.get('novelty_score'))}</div>"
+        )
+        matched = row.get("matched_topic_slug") or "-"
+        body.append(
+            f"""
+            <tr>
+              <td>
+                <strong>{e(row.get("candidate_slug"))}</strong>
+                <div class="subtle">{e(row.get("topic_name"))}</div>
+              </td>
+              <td>{status}</td>
+              <td>{score}</td>
+              <td>{coverage}</td>
+              <td>{e(clip_text(row.get("gdelt_query") or "", 120))}</td>
+              <td>{format_list(row.get("keywords"), limit=6)}</td>
+              <td>{format_list(row.get("ticker_hints"), limit=6)}</td>
+              <td>{format_list(row.get("source_types"), limit=4)}</td>
+              <td>{e(matched)}</td>
+              <td>{format_topic_candidate_evidence(row.get("evidence"))}</td>
+              <td>{fmt(row.get("last_seen_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>候选主题</th><th>状态</th><th>分数</th><th>覆盖</th>"
+            "<th>GDELT query</th><th>关键词</th><th>相关标的</th>"
+            "<th>来源</th><th>匹配正式主题</th><th>证据</th><th>最近发现</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_topic_candidate_status(status: Any) -> str:
+    text = str(status or "pending")
+    if text == "pending":
+        return '<span class="badge watch">待审核</span>'
+    if text == "promoted":
+        return '<span class="badge ok">已晋升</span>'
+    if text == "rejected":
+        return '<span class="badge muted">已拒绝</span>'
+    if text == "ignored":
+        return '<span class="badge muted">已忽略</span>'
+    return f'<span class="badge muted">{e(text)}</span>'
+
+
+def format_topic_candidate_evidence(value: Any) -> str:
+    if not isinstance(value, list | tuple) or not value:
+        return "-"
+
+    items = []
+    for item in value[:2]:
+        if not isinstance(item, dict):
+            continue
+        title = clip_text(str(item.get("title") or item.get("source_uid") or ""), 86)
+        source_name = item.get("source_name") or item.get("source_type") or "-"
+        url = item.get("url")
+        title_html = e(title)
+        if url:
+            title_html = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{title_html}</a>'
+        items.append(f'{title_html}<div class="subtle">{e(source_name)}</div>')
+
+    return "<br>".join(items) if items else "-"
+
+
 def render_topic_mentions_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_state("暂无主题提及。")
@@ -1947,21 +2196,25 @@ def render_migrations_table(rows: list[dict[str, Any]]) -> str:
 
 
 def table(head: str, body: str) -> str:
-    return f'<div class="table-wrap"><table><thead>{head}</thead><tbody>{body}</tbody></table></div>'
+    return (
+        '<div class="table-panel"><div class="table-wrap">'
+        f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
+        "</div></div>"
+    )
 
 
 def metric_box(label: str, value: Any, hint: str) -> str:
     return f"""
-    <div class="metric">
+    <article class="metric">
       <div class="metric-label">{e(label)}</div>
       <div class="metric-value">{fmt(value)}</div>
       <div class="metric-hint">{e(hint)}</div>
-    </div>
+    </article>
     """
 
 
 def empty_state(message: str) -> str:
-    return f'<div class="empty">{e(message)}</div>'
+    return f'<div class="empty" role="status">{e(message)}</div>'
 
 
 def render_database_error(exc: Exception, *, active: str) -> str:
@@ -1997,142 +2250,353 @@ def layout(
     notice = form_value(query, "notice")
     notice_type = form_value(query, "notice_type") or "ok"
     notice_html = (
-        f'<div class="notice {e(notice_type)}">{e(notice)}</div>' if notice else ""
+        f"""
+        <div class="notice {e(notice_type)}" role="status" x-data="{{show: true}}" x-show="show">
+          <span>{e(notice)}</span>
+          <button class="notice-close" type="button" aria-label="关闭提示" @click="show = false">×</button>
+        </div>
+        """
+        if notice
+        else ""
     )
     nav_items = [
-        ("/", "控制台"),
-        ("/stocks", "股票池"),
-        ("/sec", "SEC"),
-        ("/gdelt", "GDELT"),
-        ("/finnhub", "Finnhub"),
-        ("/topics", "主题"),
-        ("/tasks", "同步"),
+        ("/", "控制台", "总览"),
+        ("/stocks", "股票池", "标的维护"),
+        ("/sec", "SEC", "公告与事实"),
+        ("/gdelt", "GDELT", "全球新闻"),
+        ("/finnhub", "Finnhub", "金融新闻"),
+        ("/topics", "主题", "热点与评分"),
+        ("/tasks", "同步", "数据任务"),
     ]
-    nav = "".join(
-        f'<a class="{ "active" if href == active else "" }" href="{href}">{label}</a>'
-        for href, label in nav_items
-    )
+    nav_parts = []
+    for href, label, hint in nav_items:
+        active_class = " active" if href == active else ""
+        aria_current = ' aria-current="page"' if href == active else ""
+        nav_parts.append(
+            f"""
+            <a class="nav-link{active_class}" href="{href}"{aria_current} @click="navOpen = false">
+              <span class="nav-mark"></span>
+              <span class="nav-text">
+                <strong>{e(label)}</strong>
+                <small>{e(hint)}</small>
+              </span>
+            </a>
+            """
+        )
+    nav = "".join(nav_parts)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{e(title)} · USStock</title>
+  <link rel="stylesheet" href="{PICO_CSS_URL}">
+  <script src="{HTMX_JS_URL}" defer></script>
+  <script src="{ALPINE_JS_URL}" defer></script>
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f7f8fa;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #667085;
-      --line: #d8dee8;
-      --primary: #176b87;
-      --primary-hover: #12536a;
-      --ok: #2f7d32;
-      --watch: #9a5b00;
-      --error: #b42318;
+      --pico-font-family-sans-serif: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --pico-border-radius: 0.5rem;
+      --pico-form-element-spacing-vertical: 0.55rem;
+      --pico-form-element-spacing-horizontal: 0.7rem;
+      --bg: #f6f7f8;
+      --surface: #ffffff;
+      --surface-soft: #f8faf9;
+      --ink: #202421;
+      --muted: #68716d;
+      --line: #dfe4e1;
+      --line-strong: #c8d0cb;
+      --nav: #171b19;
+      --nav-soft: #212722;
+      --primary: #13795b;
+      --primary-hover: #0f6049;
+      --accent: #a15c10;
+      --ok: #237847;
+      --watch: #996600;
+      --error: #b3261e;
+      --shadow: 0 18px 50px rgba(31, 37, 35, 0.08);
     }}
-    * {{ box-sizing: border-box; }}
+    * {{
+      box-sizing: border-box;
+    }}
+    [x-cloak] {{
+      display: none !important;
+    }}
     body {{
       margin: 0;
       background: var(--bg);
-      color: var(--text);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      font-family: var(--pico-font-family-sans-serif);
       font-size: 14px;
       letter-spacing: 0;
     }}
-    header {{
+    body, input, textarea, select, button {{
+      letter-spacing: 0;
+    }}
+    a {{
+      color: var(--primary);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }}
+    .app-shell {{
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+    }}
+    .sidebar {{
       position: sticky;
       top: 0;
-      z-index: 2;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      padding: 22px 16px;
+      background: var(--nav);
+      color: #eef4f1;
+    }}
+    .brand {{
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      min-height: 58px;
-      padding: 0 22px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.96);
-      backdrop-filter: blur(8px);
+      gap: 11px;
+      min-height: 44px;
+      padding: 0 8px;
     }}
-    .brand {{ font-weight: 700; font-size: 16px; }}
-    nav {{ display: flex; align-items: center; gap: 4px; overflow-x: auto; }}
-    nav a {{
-      display: inline-flex;
-      align-items: center;
+    .brand-mark {{
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
       height: 36px;
-      padding: 0 12px;
-      border-radius: 6px;
-      color: var(--muted);
+      border-radius: 8px;
+      background: #dfeee8;
+      color: var(--primary);
+      font-weight: 800;
+    }}
+    .brand-title {{
+      display: grid;
+      line-height: 1.2;
+    }}
+    .brand-title strong {{
+      color: #ffffff;
+      font-size: 16px;
+    }}
+    .brand-title span {{
+      color: #a9b7b1;
+      font-size: 12px;
+    }}
+    .nav-list {{
+      display: grid;
+      gap: 6px;
+      margin-top: 4px;
+    }}
+    .nav-link {{
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      min-height: 54px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      color: #cbd7d2;
       text-decoration: none;
+      transition: background 140ms ease, color 140ms ease;
+    }}
+    .nav-link:hover, .nav-link.active {{
+      background: var(--nav-soft);
+      color: #ffffff;
+    }}
+    .nav-mark {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: transparent;
+    }}
+    .nav-link.active .nav-mark {{
+      background: #5bd2a4;
+    }}
+    .nav-text {{
+      display: grid;
+      min-width: 0;
+      line-height: 1.2;
+    }}
+    .nav-text strong {{
+      overflow: hidden;
+      color: inherit;
+      font-size: 14px;
+      text-overflow: ellipsis;
       white-space: nowrap;
     }}
-    nav a.active, nav a:hover {{ background: #e8f3f6; color: var(--primary); }}
-    main {{
-      width: min(1240px, calc(100vw - 28px));
-      margin: 22px auto 56px;
+    .nav-text small {{
+      margin-top: 4px;
+      overflow: hidden;
+      color: #98a8a1;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
-    section {{
-      margin-top: 18px;
-      padding: 18px;
-      border: 1px solid var(--line);
+    .sidebar-note {{
+      margin-top: auto;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.09);
       border-radius: 8px;
-      background: var(--panel);
+      color: #b7c5bf;
+      background: rgba(255, 255, 255, 0.04);
+      font-size: 12px;
+      line-height: 1.55;
     }}
-    h1, h2 {{ margin: 0; line-height: 1.25; }}
-    h1 {{ font-size: 24px; }}
-    h2 {{ margin-bottom: 14px; font-size: 16px; }}
-    p {{ margin: 0 0 14px; color: var(--muted); }}
-    .toolbar {{
+    .content-shell {{
+      min-width: 0;
+    }}
+    .topbar {{
+      position: sticky;
+      top: 0;
+      z-index: 4;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
+      gap: 16px;
+      min-height: 64px;
+      padding: 0 28px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(246, 247, 248, 0.92);
+      backdrop-filter: blur(12px);
+    }}
+    .topbar-title {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+    .topbar-title span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .topbar-title strong {{
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 16px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .topbar-actions {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    button.nav-toggle {{
+      display: none;
+      width: 40px;
+      min-width: 40px;
+      height: 40px;
+      padding: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }}
+    .nav-toggle-lines {{
+      display: grid;
+      gap: 4px;
+      width: 16px;
+      margin: auto;
+    }}
+    .nav-toggle-lines span {{
+      display: block;
+      height: 2px;
+      border-radius: 999px;
+      background: currentColor;
+    }}
+    main.content {{
+      width: min(1260px, calc(100vw - 312px));
+      margin: 0 auto;
+      padding: 26px 28px 64px;
+    }}
+    section {{
+      margin-top: 24px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }}
+    section:first-child {{
+      margin-top: 0;
+    }}
+    h1, h2 {{
+      margin: 0;
+      color: var(--ink);
+      line-height: 1.25;
+    }}
+    h1 {{
+      font-size: 24px;
+    }}
+    h2 {{
+      margin-bottom: 12px;
+      font-size: 16px;
+    }}
+    p {{
+      margin: 0 0 14px;
+      color: var(--muted);
+      line-height: 1.55;
+    }}
+    .toolbar, section.toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
       flex-wrap: wrap;
+    }}
+    section.toolbar {{
+      min-height: 48px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
     }}
     .metrics {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
       gap: 12px;
-      padding: 0;
-      border: 0;
-      background: transparent;
     }}
     .metric {{
-      min-height: 108px;
+      min-height: 112px;
       padding: 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--panel);
+      background: var(--surface);
+      box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
     }}
-    .metric-label, .metric-hint, .subtle {{ color: var(--muted); }}
+    .metric-label, .metric-hint, .subtle {{
+      color: var(--muted);
+    }}
+    .metric-label {{
+      font-size: 12px;
+      font-weight: 700;
+    }}
     .metric-value {{
-      margin: 7px 0 5px;
-      font-size: 27px;
-      font-weight: 750;
+      margin: 8px 0 6px;
+      color: var(--ink);
+      font-size: 26px;
+      font-weight: 760;
+      line-height: 1.05;
+      overflow-wrap: anywhere;
+    }}
+    .metric-hint {{
+      font-size: 12px;
+      line-height: 1.4;
     }}
     .split {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
       gap: 18px;
-      padding: 0;
-      border: 0;
-      background: transparent;
     }}
     .split > div {{
       padding: 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--panel);
+      background: var(--surface);
       min-width: 0;
     }}
     .task-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
       gap: 18px;
-      padding: 0;
-      border: 0;
-      background: transparent;
+      align-items: flex-start;
     }}
     .task-grid form {{
       display: grid;
@@ -2140,7 +2604,8 @@ def layout(
       padding: 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--panel);
+      background: var(--surface);
+      box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
     }}
     .button-row {{
       display: flex;
@@ -2152,124 +2617,355 @@ def layout(
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
+      margin: 0;
     }}
     .grid-form {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
       gap: 12px;
       align-items: end;
+      margin: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
     }}
-    .span-2 {{ grid-column: 1 / -1; }}
-    label {{ display: grid; gap: 6px; color: var(--muted); }}
-    input, textarea {{
+    .span-2 {{
+      grid-column: 1 / -1;
+    }}
+    label {{
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    input:not([type="checkbox"]), textarea {{
       width: 100%;
       min-height: 38px;
       padding: 8px 10px;
-      border: 1px solid #c9d1dc;
+      border: 1px solid var(--line-strong);
       border-radius: 6px;
-      background: #fff;
-      color: var(--text);
+      background: #ffffff;
+      color: var(--ink);
       font: inherit;
+      font-size: 14px;
     }}
-    textarea {{ resize: vertical; }}
+    textarea {{
+      resize: vertical;
+    }}
+    input:not([type="checkbox"]) {{
+      height: 42px;
+    }}
     label:has(input[type="checkbox"]) {{
       display: flex;
       align-items: center;
       gap: 8px;
       min-height: 38px;
+      color: var(--ink);
+      font-weight: 500;
     }}
-    input[type="checkbox"] {{ width: 16px; min-height: 16px; }}
-    button, .button {{
+    input[type="checkbox"] {{
+      width: 16px;
+      min-height: 16px;
+      margin: 0;
+    }}
+    button, [type="submit"], [type="button"], .button {{
       display: inline-flex;
       align-items: center;
       justify-content: center;
       min-height: 38px;
       padding: 0 13px;
-      border: 1px solid #b8c1cc;
+      border: 1px solid var(--line-strong);
       border-radius: 6px;
-      background: #fff;
-      color: var(--text);
+      background: #ffffff;
+      color: var(--ink);
       font: inherit;
+      font-size: 14px;
+      font-weight: 650;
+      line-height: 1.2;
       text-decoration: none;
       cursor: pointer;
       white-space: nowrap;
+      transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+    }}
+    button:hover, [type="submit"]:hover, [type="button"]:hover, .button:hover {{
+      border-color: #aeb8b2;
+      background: #f8faf9;
+      text-decoration: none;
     }}
     button.primary, .button.primary {{
       border-color: var(--primary);
       background: var(--primary);
       color: #fff;
     }}
-    button.primary:hover, .button.primary:hover {{ background: var(--primary-hover); }}
-    .table-wrap {{ overflow-x: auto; }}
+    button.primary:hover, .button.primary:hover {{
+      border-color: var(--primary-hover);
+      background: var(--primary-hover);
+    }}
+    .button.ghost {{
+      background: transparent;
+    }}
+    .table-panel {{
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
       min-width: 720px;
+      margin: 0;
+      font-size: 13px;
     }}
     th, td {{
       padding: 10px 11px;
-      border-bottom: 1px solid #edf0f4;
+      border-bottom: 1px solid #edf0ed;
       text-align: left;
       vertical-align: top;
+    }}
+    tbody tr:last-child td {{
+      border-bottom: 0;
     }}
     th {{
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
-      background: #fafbfc;
+      background: var(--surface-soft);
     }}
-    a {{ color: var(--primary); }}
     .badge {{
       display: inline-flex;
       align-items: center;
       height: 22px;
       padding: 0 8px;
       border-radius: 999px;
-      background: #eef2f6;
+      background: #edf2ef;
       color: var(--muted);
       font-size: 12px;
+      font-weight: 700;
       white-space: nowrap;
     }}
-    .badge.ok {{ background: #e7f5e8; color: var(--ok); }}
-    .badge.watch {{ background: #fff3d6; color: var(--watch); }}
-    .badge.muted {{ background: #eef2f6; color: var(--muted); }}
+    .badge.ok {{
+      background: #e4f4ea;
+      color: var(--ok);
+    }}
+    .badge.watch {{
+      background: #fff2cc;
+      color: var(--watch);
+    }}
+    .badge.muted {{
+      background: #edf2ef;
+      color: var(--muted);
+    }}
     .empty {{
       padding: 16px;
-      border: 1px dashed #c8d0dc;
+      border: 1px dashed var(--line-strong);
       border-radius: 8px;
       color: var(--muted);
-      background: #fbfcfd;
+      background: var(--surface-soft);
     }}
     .notice {{
+      position: relative;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
       margin-bottom: 14px;
       padding: 12px 14px;
       border-radius: 8px;
-      border: 1px solid #c8d0dc;
-      background: #fff;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      box-shadow: var(--shadow);
     }}
-    .notice.ok {{ border-color: #b7dfba; color: var(--ok); background: #f1faf2; }}
-    .notice.error {{ border-color: #f0b8b2; color: var(--error); background: #fff5f4; }}
-    .error-text {{ color: var(--error); }}
+    .notice.ok {{
+      border-color: #b8dfc5;
+      color: var(--ok);
+      background: #f1faf4;
+    }}
+    .notice.error {{
+      border-color: #edb8b4;
+      color: var(--error);
+      background: #fff5f4;
+    }}
+    .notice-close {{
+      width: 28px;
+      min-width: 28px;
+      height: 28px;
+      min-height: 28px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: currentColor;
+      font-size: 18px;
+      line-height: 1;
+    }}
+    .status-panel {{
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }}
+    .error-text {{
+      color: var(--error);
+    }}
+    .loading-bar {{
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: 30;
+      width: 100%;
+      height: 3px;
+      opacity: 0;
+      background: linear-gradient(90deg, var(--primary), #d99a2b, var(--primary));
+      background-size: 220% 100%;
+      transition: opacity 120ms ease;
+      animation: loading-shift 900ms linear infinite;
+    }}
+    .loading-bar.htmx-request {{
+      opacity: 1;
+    }}
+    @keyframes loading-shift {{
+      from {{
+        background-position: 0 0;
+      }}
+      to {{
+        background-position: 220% 0;
+      }}
+    }}
+    .mobile-scrim {{
+      display: none;
+    }}
     @media (max-width: 720px) {{
-      header {{ align-items: flex-start; flex-direction: column; padding: 12px 14px; }}
-      main {{ width: min(100vw - 18px, 1240px); margin-top: 14px; }}
-      section, .split > div, .task-grid form {{ padding: 14px; }}
-      h1 {{ font-size: 21px; }}
-      .split {{ grid-template-columns: 1fr; }}
-      .filters {{ align-items: stretch; }}
-      .filters input {{ min-width: 100%; }}
+      .app-shell {{
+        grid-template-columns: 1fr;
+      }}
+      .sidebar {{
+        position: fixed;
+        inset: 0 auto 0 0;
+        z-index: 20;
+        width: min(84vw, 286px);
+        transform: translateX(-102%);
+        transition: transform 180ms ease;
+      }}
+      .sidebar.is-open {{
+        transform: translateX(0);
+      }}
+      .mobile-scrim {{
+        position: fixed;
+        inset: 0;
+        z-index: 19;
+        display: block;
+        background: rgba(16, 20, 18, 0.42);
+      }}
+      .topbar {{
+        padding: 0 14px;
+      }}
+      button.nav-toggle {{
+        display: inline-flex;
+      }}
+      main.content {{
+        width: 100%;
+        padding: 18px 12px 44px;
+      }}
+      section.toolbar {{
+        align-items: flex-start;
+        flex-direction: column;
+      }}
+      h1 {{
+        font-size: 21px;
+      }}
+      .split {{
+        grid-template-columns: 1fr;
+      }}
+      .split > div, .task-grid form, .status-panel {{
+        padding: 14px;
+      }}
+      .grid-form {{
+        padding: 14px;
+      }}
+      .filters {{
+        width: 100%;
+        align-items: stretch;
+      }}
+      .filters input, .filters select, .filters button, .filters .button {{
+        width: 100%;
+        min-width: 100%;
+      }}
+      .topbar-actions .button {{
+        display: none;
+      }}
+      .metric-value {{
+        font-size: 24px;
+      }}
+    }}
+    @media (min-width: 721px) and (max-width: 1100px) {{
+      .app-shell {{
+        grid-template-columns: 218px minmax(0, 1fr);
+      }}
+      main.content {{
+        width: calc(100vw - 218px);
+      }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">USStock</div>
-    <nav>{nav}</nav>
-  </header>
-  <main>
-    {notice_html}
-    {body}
-  </main>
+  <div
+    id="app"
+    class="app-shell"
+    x-data="{{navOpen: false}}"
+    hx-boost="true"
+    hx-target="#app"
+    hx-select="#app"
+    hx-swap="outerHTML show:window:top"
+    hx-indicator="#global-loading"
+  >
+    <div id="global-loading" class="loading-bar" aria-hidden="true"></div>
+    <div class="mobile-scrim" x-cloak x-show="navOpen" @click="navOpen = false"></div>
+    <aside class="sidebar" :class="{{'is-open': navOpen}}" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark">US</span>
+        <span class="brand-title">
+          <strong>USStock</strong>
+          <span>本地研究控制面板</span>
+        </span>
+      </div>
+      <nav class="nav-list">{nav}</nav>
+      <div class="sidebar-note">轻量本地面板，无登录和权限系统。数据动作仍由当前 Python 服务执行。</div>
+    </aside>
+    <div class="content-shell">
+      <header class="topbar">
+        <button
+          class="nav-toggle"
+          type="button"
+          aria-label="打开导航"
+          :aria-expanded="navOpen.toString()"
+          @click="navOpen = !navOpen"
+        >
+          <span class="nav-toggle-lines" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </span>
+        </button>
+        <div class="topbar-title">
+          <span>Local Admin</span>
+          <strong>{e(title)}</strong>
+        </div>
+        <div class="topbar-actions">
+          <a class="button ghost" href="/tasks">同步任务</a>
+        </div>
+      </header>
+      <main class="content">
+        {notice_html}
+        {body}
+      </main>
+    </div>
+  </div>
 </body>
 </html>"""
 

@@ -363,6 +363,18 @@ usstock discover seed-topics
 usstock discover daily --top-n 25
 ```
 
+从已入库的 Finnhub 和 GDELT 新闻中抽取候选主题：
+
+```bash
+usstock discover extract-topics --lookback-hours 72 --max-candidates 25
+```
+
+候选主题会先写入 `market_topic_candidates`，默认不会直接污染正式主题库。确认后可以按 slug 晋升到 `market_topics`：
+
+```bash
+usstock discover promote-topics --slug quantum_computing
+```
+
 如果只想用库内已有的 GDELT、Finnhub、SEC 数据重新评分，不触发外部请求：
 
 ```bash

@@ -500,6 +500,7 @@ def upsert_market_topics(conn: Connection, topics: tuple[MarketTopic, ...]) -> i
                 metadata = market_topics.metadata || EXCLUDED.metadata,
                 last_refreshed_at = now(),
                 updated_at = now()
+            WHERE market_topics.data_source = 'seed'
             """,
             (
                 topic.topic_slug,
@@ -1647,6 +1648,38 @@ def add_daily_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
 
 
+def add_extract_topics_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    parser.add_argument("--lookback-hours", type=int, default=72)
+    parser.add_argument("--max-candidates", type=int, default=25)
+    parser.add_argument("--min-articles", type=int, default=2)
+    parser.add_argument("--min-score", default="8")
+    parser.add_argument(
+        "--include-existing-matches",
+        action="store_true",
+        help="保留与现有正式主题相近的候选主题，默认会过滤",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只打印结果，不写入数据库")
+
+
+def add_promote_topics_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    parser.add_argument(
+        "--slug",
+        action="append",
+        dest="slugs",
+        help="要晋升的候选主题 slug，可重复传入；不传则按阈值自动选择",
+    )
+    parser.add_argument("--min-score", default="20")
+    parser.add_argument("--min-articles", type=int, default=3)
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument(
+        "--activate",
+        action="store_true",
+        help="晋升后立即启用主题；默认写入正式主题库但不启用",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run automatic market discovery.")
     subparsers = parser.add_subparsers(dest="command")
@@ -1656,6 +1689,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     daily_parser = subparsers.add_parser("daily", help="运行一次每日热点发现和候选股评分")
     add_daily_args(daily_parser)
+
+    extract_parser = subparsers.add_parser("extract-topics", help="从最近新闻中抽取候选主题")
+    add_extract_topics_args(extract_parser)
+
+    promote_parser = subparsers.add_parser("promote-topics", help="将候选主题晋升到正式主题库")
+    add_promote_topics_args(promote_parser)
 
     loop_parser = subparsers.add_parser("loop", help="按固定间隔循环运行每日热点发现")
     add_daily_args(loop_parser)
@@ -1701,6 +1740,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "daily":
             result = run_from_args(args)
             print(render_result(result))
+            return 0
+
+        if args.command == "extract-topics":
+            from usstock.discovery import topic_candidates
+
+            result = topic_candidates.run_topic_extraction(
+                database_url=args.database_url,
+                lookback_hours=args.lookback_hours,
+                max_candidates=args.max_candidates,
+                min_articles=args.min_articles,
+                min_score=args.min_score,
+                include_existing_matches=args.include_existing_matches,
+                dry_run=args.dry_run,
+            )
+            print(topic_candidates.render_extraction_result(result))
+            return 0
+
+        if args.command == "promote-topics":
+            from usstock.discovery import topic_candidates
+
+            result = topic_candidates.promote_topic_candidates(
+                database_url=args.database_url,
+                slugs=tuple(args.slugs or ()),
+                min_score=args.min_score,
+                min_articles=args.min_articles,
+                limit=args.limit,
+                activate=args.activate,
+            )
+            print(topic_candidates.render_promotion_result(result))
             return 0
 
         if args.command == "loop":
