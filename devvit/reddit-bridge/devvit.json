@@ -1,0 +1,93 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "usstock-bridge",
+  "server": {
+    "entry": "dist/index.js"
+  },
+  "permissions": {
+    "http": {
+      "enable": true,
+      "domains": ["127.0.0.1:7878"]
+    },
+    "reddit": {
+      "enable": true
+    }
+  },
+  "settings": {
+    "global": {
+      "usstockWebhookUrl": {
+        "type": "string",
+        "label": "usstock webhook URL",
+        "defaultValue": "https://127.0.0.1:7878/api/reddit/devvit/posts"
+      },
+      "usstockWebhookSecret": {
+        "type": "string",
+        "label": "usstock webhook secret",
+        "isSecret": true
+      }
+    },
+    "subreddit": {
+      "subredditNames": {
+        "type": "string",
+        "label": "Subreddits to sync",
+        "defaultValue": "stocks,investing,wallstreetbets,SecurityAnalysis"
+      },
+      "listing": {
+        "type": "select",
+        "label": "Listing",
+        "options": [
+          {"label": "new", "value": "new"},
+          {"label": "hot", "value": "hot"},
+          {"label": "top", "value": "top"},
+          {"label": "rising", "value": "rising"},
+          {"label": "controversial", "value": "controversial"}
+        ],
+        "defaultValue": "new"
+      },
+      "timeFilter": {
+        "type": "select",
+        "label": "Time filter",
+        "options": [
+          {"label": "hour", "value": "hour"},
+          {"label": "day", "value": "day"},
+          {"label": "week", "value": "week"},
+          {"label": "month", "value": "month"},
+          {"label": "year", "value": "year"},
+          {"label": "all", "value": "all"}
+        ],
+        "defaultValue": "day"
+      },
+      "limit": {
+        "type": "number",
+        "label": "Posts per subreddit",
+        "defaultValue": 50
+      }
+    }
+  },
+  "scheduler": {
+    "tasks": {
+      "sync-reddit-defaults": {
+        "endpoint": "/internal/cron/sync-reddit-defaults",
+        "cron": "*/30 * * * *"
+      }
+    }
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Sync usstock Reddit signals",
+        "description": "Push recent subreddit posts to the usstock research backend",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/sync-reddit"
+      }
+    ]
+  },
+  "dev": {
+    "subreddit": "stocks"
+  },
+  "scripts": {
+    "dev": "npm run dev",
+    "build": "npm run build"
+  }
+}

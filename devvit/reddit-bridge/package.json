@@ -1,0 +1,19 @@
+{
+  "name": "summmmmmer312",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "login": "npx devvit login",
+    "playtest": "npx devvit playtest",
+    "upload": "npx devvit upload"
+  },
+  "dependencies": {
+    "@devvit/web": "^0.13.0",
+    "hono": "^4.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

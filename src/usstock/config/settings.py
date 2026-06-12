@@ -60,6 +60,14 @@ class Settings:
     finnhub_base_url: str
     finnhub_rate_limit_per_second: float
     finnhub_request_timeout_seconds: float
+    reddit_client_id: str | None
+    reddit_client_secret: str | None
+    reddit_user_agent: str | None
+    reddit_base_url: str
+    reddit_oauth_url: str
+    reddit_rate_limit_per_second: float
+    reddit_request_timeout_seconds: float
+    reddit_devvit_webhook_secret: str | None
 
 
 @lru_cache(maxsize=1)
@@ -131,6 +139,38 @@ def get_settings() -> Settings:
         or env_file_values.get("FINNHUB_REQUEST_TIMEOUT_SECONDS")
         or "30"
     )
+    reddit_client_id = os.environ.get("REDDIT_CLIENT_ID") or env_file_values.get(
+        "REDDIT_CLIENT_ID"
+    )
+    reddit_client_secret = os.environ.get(
+        "REDDIT_CLIENT_SECRET"
+    ) or env_file_values.get("REDDIT_CLIENT_SECRET")
+    reddit_user_agent = os.environ.get("REDDIT_USER_AGENT") or env_file_values.get(
+        "REDDIT_USER_AGENT"
+    )
+    reddit_base_url = (
+        os.environ.get("REDDIT_BASE_URL")
+        or env_file_values.get("REDDIT_BASE_URL")
+        or "https://oauth.reddit.com"
+    ).rstrip("/")
+    reddit_oauth_url = (
+        os.environ.get("REDDIT_OAUTH_URL")
+        or env_file_values.get("REDDIT_OAUTH_URL")
+        or "https://www.reddit.com/api/v1/access_token"
+    )
+    reddit_rate_limit_per_second = float(
+        os.environ.get("REDDIT_RATE_LIMIT_PER_SECOND")
+        or env_file_values.get("REDDIT_RATE_LIMIT_PER_SECOND")
+        or "0.5"
+    )
+    reddit_request_timeout_seconds = float(
+        os.environ.get("REDDIT_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("REDDIT_REQUEST_TIMEOUT_SECONDS")
+        or "30"
+    )
+    reddit_devvit_webhook_secret = os.environ.get(
+        "REDDIT_DEVVIT_WEBHOOK_SECRET"
+    ) or env_file_values.get("REDDIT_DEVVIT_WEBHOOK_SECRET")
 
     migrations_dir = Path(migrations_dir_value).expanduser()
     if not migrations_dir.is_absolute():
@@ -151,4 +191,12 @@ def get_settings() -> Settings:
         finnhub_base_url=finnhub_base_url,
         finnhub_rate_limit_per_second=finnhub_rate_limit_per_second,
         finnhub_request_timeout_seconds=finnhub_request_timeout_seconds,
+        reddit_client_id=reddit_client_id,
+        reddit_client_secret=reddit_client_secret,
+        reddit_user_agent=reddit_user_agent,
+        reddit_base_url=reddit_base_url,
+        reddit_oauth_url=reddit_oauth_url,
+        reddit_rate_limit_per_second=reddit_rate_limit_per_second,
+        reddit_request_timeout_seconds=reddit_request_timeout_seconds,
+        reddit_devvit_webhook_secret=reddit_devvit_webhook_secret,
     )

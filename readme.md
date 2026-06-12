@@ -353,9 +353,75 @@ usstock finnhub sync-market --category general
 usstock finnhub sync-company AAPL --from-date 2026-06-01 --to-date 2026-06-09
 ```
 
+### Reddit / Devvit 接入
+
+Reddit API 用于低权重社区讨论信号，默认关注 `r/stocks`、`r/investing`、`r/wallstreetbets`、`r/SecurityAnalysis`。它不作为单独触发候选股的主信号，只在已有 SEC、GDELT 或 Finnhub 证据时提供讨论热度加分。
+
+推荐使用 Devvit bridge，因为它不需要在 old Reddit API 页面创建 app，也不需要维护 `client_id/client_secret`。Devvit 负责读取 Reddit 帖子，然后把 JSON 推送到本项目的 webhook，Python 侧继续写入 `reddit_post_queries` 和 `reddit_posts`。
+
+先配置 webhook 共享密钥：
+
+```bash
+REDDIT_DEVVIT_WEBHOOK_SECRET=replace-with-a-long-random-secret
+```
+
+启动管理面板或部署同等 HTTP 服务，并暴露一个 Devvit 可访问的 HTTPS 地址：
+
+```text
+https://your-domain.example/api/reddit/devvit/posts
+```
+
+Devvit 子项目在 `devvit/reddit-bridge`。使用前需要把 `devvit/reddit-bridge/devvit.json` 里的 HTTP allow-list 域名从 `example.com` 改成你的公开后端 hostname，然后在 Devvit settings 里设置：
+
+```text
+usstockWebhookUrl=https://your-domain.example/api/reddit/devvit/posts
+usstockWebhookSecret=<和 REDDIT_DEVVIT_WEBHOOK_SECRET 相同>
+```
+
+构建和 playtest：
+
+```bash
+cd devvit/reddit-bridge
+npm install
+npm run login
+npm run build
+npm run playtest
+```
+
+Devvit 默认每 30 分钟同步一次，也可以在 subreddit 菜单里手动触发 `Sync usstock Reddit signals`。
+
+如果 Devvit 暂时不可用，也可以保留传统 Reddit OAuth 作为备用。传统方式需要在 Reddit 创建 script/web app，并配置 OAuth client credentials 和 User-Agent：
+
+```bash
+REDDIT_CLIENT_ID=your_client_id
+REDDIT_CLIENT_SECRET=your_client_secret
+REDDIT_USER_AGENT="usstock/0.1 by your_reddit_username or email"
+```
+
+同步单个 subreddit：
+
+```bash
+.venv/bin/python -m usstock.data.reddit sync-subreddit stocks --listing new --limit 50
+```
+
+同步 README 建议的默认投资社区：
+
+```bash
+.venv/bin/python -m usstock.data.reddit sync-defaults --listing new --limit 50
+```
+
+如果项目已安装为可执行命令，也可以使用：
+
+```bash
+usstock reddit sync-subreddit stocks --listing new --limit 50
+usstock reddit sync-defaults --listing new --limit 50
+```
+
+原始查询会落到 `reddit_post_queries`，标准化帖子会落到 `reddit_posts`，并抽取候选 ticker 和关键词。Reddit OAuth bearer token 只通过请求头发送，不会写入数据库。
+
 ### 自动热点发现和每日候选股
 
-自动发现流程会写入默认主题库，用主题库替代人工 GDELT query；同步 Finnhub market news 并抽取相关 ticker 和关键词；扫描股票池中的 SEC filings；最后生成每日候选股评分和观察清单。
+自动发现流程会写入默认主题库，用主题库替代人工 GDELT query；同步 Finnhub market news 并抽取相关 ticker 和关键词；同步 Reddit 默认投资社区作为低权重社区信号；扫描股票池中的 SEC filings；最后生成每日候选股评分和观察清单。
 
 ```bash
 usstock migrate
@@ -387,7 +453,7 @@ usstock discover daily --skip-sync --top-n 25
 usstock discover loop --interval-minutes 60
 ```
 
-默认配置会同步 Finnhub `general` 和 `merger` 两个 market news 分类；GDELT 会按主题库逐个同步；SEC 会扫描股票池中排序靠前的活跃标的。可以用 `--max-sec-tickers`、`--skip-gdelt-sync`、`--skip-finnhub-sync`、`--skip-sec-sync` 控制同步范围。
+默认配置会同步 Finnhub `general` 和 `merger` 两个 market news 分类；GDELT 会按主题库逐个同步；Reddit 会同步默认投资社区；SEC 会扫描股票池中排序靠前的活跃标的。可以用 `--max-sec-tickers`、`--reddit-subreddit`、`--reddit-listing`、`--skip-gdelt-sync`、`--skip-finnhub-sync`、`--skip-reddit-sync`、`--skip-sec-sync` 控制同步范围。
 
 ### 本地管理面板
 
@@ -418,9 +484,9 @@ http://127.0.0.1:7878
 
 第一版面板只覆盖最常用的内部操作：
 
-* 查看股票池、SEC 公告、GDELT 文章、Finnhub 新闻和最近迁移记录。
+* 查看股票池、SEC 公告、GDELT 文章、Finnhub 新闻、Reddit 帖子和最近迁移记录。
 * 手工新增或更新观察标的。
-* 触发 SEC 公司映射、单只 ticker、GDELT query 和 Finnhub News 同步。
+* 触发 SEC 公司映射、单只 ticker、GDELT query、Finnhub News 和 Reddit 社区同步。
 
 ### Phase 1：投研数据管道和日报
 

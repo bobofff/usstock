@@ -19,7 +19,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from usstock.config.settings import get_settings
-from usstock.data import finnhub, gdelt, sec
+from usstock.data import finnhub, gdelt, reddit, sec
 from usstock.db import migrations as db_migrations
 
 
@@ -29,6 +29,9 @@ DEFAULT_TOP_N = 25
 DEFAULT_MAX_SEC_TICKERS = 50
 DEFAULT_SEC_FILING_LIMIT = 20
 DEFAULT_FINNHUB_CATEGORIES = ("general", "merger")
+DEFAULT_REDDIT_SUBREDDITS = reddit.DEFAULT_SUBREDDITS
+DEFAULT_REDDIT_LISTING = reddit.DEFAULT_LISTING
+DEFAULT_REDDIT_LIMIT = 50
 
 STOPWORDS = {
     "about",
@@ -158,6 +161,8 @@ class CandidateAccumulator:
     recent_titles: list[str] = field(default_factory=list)
     gdelt_titles: list[str] = field(default_factory=list)
     sec_titles: list[str] = field(default_factory=list)
+    reddit_post_uids: set[str] = field(default_factory=set)
+    reddit_comment_count: int = 0
     market_cap_usd: Decimal | None = None
     avg_volume_30d: Decimal | None = None
     fact_count: int = 0
@@ -176,11 +181,13 @@ class CandidateScore:
     news_score: Decimal
     gdelt_score: Decimal
     sec_score: Decimal
+    reddit_score: Decimal
     fundamental_score: Decimal
     liquidity_score: Decimal
     finnhub_article_count: int
     gdelt_article_count: int
     sec_filing_count: int
+    reddit_post_count: int
     latest_news_at: datetime | None
     latest_filing_date: date | None
     action_bias: str
@@ -712,6 +719,46 @@ def fetch_recent_sec_filings(
     ]
 
 
+def fetch_recent_reddit_posts(
+    conn: Connection,
+    *,
+    lookback_hours: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT post_uid, reddit_id, fullname, subreddit, title, selftext,
+               permalink_url, external_url, score, upvote_ratio, comment_count,
+               link_flair_text, candidate_tickers, candidate_keywords,
+               created_utc
+        FROM reddit_posts
+        WHERE coalesce(created_utc, last_seen_at, created_at)
+              >= now() - (%s::int * interval '1 hour')
+        ORDER BY coalesce(created_utc, last_seen_at, created_at) DESC
+        """,
+        (lookback_hours,),
+    ).fetchall()
+    return [
+        {
+            "post_uid": row[0],
+            "reddit_id": row[1],
+            "fullname": row[2],
+            "subreddit": row[3],
+            "title": row[4],
+            "selftext": row[5],
+            "permalink_url": row[6],
+            "external_url": row[7],
+            "score": row[8],
+            "upvote_ratio": row[9],
+            "comment_count": row[10],
+            "link_flair_text": row[11],
+            "candidate_tickers": list(row[12] or []),
+            "candidate_keywords": list(row[13] or []),
+            "created_utc": row[14],
+        }
+        for row in rows
+    ]
+
+
 def fetch_fact_counts(conn: Connection) -> dict[str, int]:
     rows = conn.execute(
         """
@@ -750,6 +797,35 @@ def maybe_sync_finnhub_market(
                 )
             except Exception as exc:
                 warnings.append(f"Finnhub category={category} 同步失败: {exc}")
+    return counts
+
+
+def maybe_sync_reddit_subreddits(
+    *,
+    database_url: str,
+    subreddits: tuple[str, ...],
+    listing: str,
+    limit: int,
+    warnings: list[str],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    try:
+        client = reddit.make_reddit_client()
+    except Exception as exc:
+        warnings.append(f"Reddit 未同步: {exc}")
+        return counts
+
+    for subreddit in subreddits:
+        try:
+            counts[reddit.normalize_subreddit(subreddit)] = reddit.sync_subreddit_posts(
+                subreddit=subreddit,
+                listing=listing,
+                limit=limit,
+                database_url=database_url,
+                client=client,
+            )
+        except Exception as exc:
+            warnings.append(f"Reddit r/{subreddit} 同步失败: {exc}")
     return counts
 
 
@@ -1091,6 +1167,82 @@ def build_sec_mentions(
     return mentions
 
 
+def build_reddit_mentions(
+    *,
+    posts: list[dict[str, Any]],
+    topics: list[MarketTopic],
+    universe: dict[str, dict[str, Any]],
+    candidates: dict[str, CandidateAccumulator],
+) -> list[TopicMention]:
+    mentions: list[TopicMention] = []
+    topic_by_hint: dict[str, list[MarketTopic]] = defaultdict(list)
+    for topic in topics:
+        for ticker in topic.ticker_hints:
+            topic_by_hint[ticker].append(topic)
+
+    for post in posts:
+        text = " ".join(
+            str(post.get(key) or "")
+            for key in ("title", "selftext", "link_flair_text")
+        )
+        post_keywords = list(post.get("candidate_keywords") or extract_keywords(text, limit=8))
+        matched_topics: list[tuple[MarketTopic, Decimal, list[str]]] = []
+        for topic in topics:
+            score, matched = topic_match_score(topic, text)
+            if score > 0:
+                matched_topics.append((topic, score, matched))
+
+        related = [normalize_ticker(ticker) for ticker in post.get("candidate_tickers", [])]
+        related_tickers = [ticker for ticker in related if ticker]
+        comment_count = int(post.get("comment_count") or 0)
+        discussion_boost = min(Decimal(comment_count) / Decimal("25"), Decimal("4"))
+        for ticker in related_tickers:
+            candidate = candidate_for(candidates, ticker, universe)
+            candidate.reddit_post_uids.add(post["post_uid"])
+            candidate.reddit_comment_count += max(0, comment_count)
+            candidate.latest_news_at = max_datetime(candidate.latest_news_at, post.get("created_utc"))
+            append_limited(candidate.recent_titles, post.get("title"))
+            for keyword in post_keywords:
+                candidate.keywords[keyword] += 1
+
+            topic_matches = matched_topics or [
+                (topic, Decimal("2"), ["ticker_hint"])
+                for topic in topic_by_hint.get(ticker, [])
+            ]
+            for topic, score, matched in topic_matches:
+                relevance = score + Decimal("1") + discussion_boost
+                add_topic_signal(candidate, topic.topic_slug, relevance)
+                mentions.append(
+                    TopicMention(
+                        mention_uid=hash_uid(
+                            "reddit_post",
+                            post["post_uid"],
+                            topic.topic_slug,
+                            ticker,
+                        ),
+                        topic_slug=topic.topic_slug,
+                        ticker=ticker,
+                        source_type="reddit_post",
+                        source_uid=post["post_uid"],
+                        source_title=post.get("title"),
+                        source_url=post.get("permalink_url"),
+                        published_at=post.get("created_utc"),
+                        relevance_score=relevance,
+                        evidence={
+                            "matched": matched[:10],
+                            "keywords": post_keywords[:8],
+                            "subreddit": post.get("subreddit"),
+                            "score": post.get("score"),
+                            "comment_count": comment_count,
+                            "upvote_ratio": str(post.get("upvote_ratio"))
+                            if post.get("upvote_ratio") is not None
+                            else None,
+                        },
+                    )
+                )
+    return mentions
+
+
 def max_datetime(left: datetime | None, right: datetime | None) -> datetime | None:
     if left is None:
         return right
@@ -1115,6 +1267,7 @@ def score_candidate(
     news_count = len(candidate.finnhub_article_uids)
     gdelt_count = len(candidate.gdelt_article_urls)
     sec_count = len(candidate.sec_accessions)
+    reddit_count = len(candidate.reddit_post_uids)
 
     news_score = Decimal(news_count * 8) + Decimal(min(sum(candidate.keywords.values()), 8))
     for title in candidate.recent_titles:
@@ -1127,6 +1280,10 @@ def score_candidate(
     for form_type, count in candidate.sec_forms.items():
         sec_score += SEC_FORM_WEIGHTS.get(form_type, Decimal("4")) * count
     sec_score = min(sec_score, Decimal("25"))
+
+    reddit_score = Decimal(reddit_count * 2)
+    reddit_score += min(Decimal(candidate.reddit_comment_count) / Decimal("25"), Decimal("6"))
+    reddit_score = min(reddit_score, Decimal("12"))
 
     fact_score = Decimal("0")
     if candidate.fact_count >= 100:
@@ -1160,7 +1317,15 @@ def score_candidate(
         Decimal(sum(candidate.topic_scores.values())) / Decimal("20"),
         Decimal("8"),
     )
-    score = news_score + gdelt_score + sec_score + fact_score + liquidity_score + topic_strength
+    score = (
+        news_score
+        + gdelt_score
+        + sec_score
+        + reddit_score
+        + fact_score
+        + liquidity_score
+        + topic_strength
+    )
     score = min(score.quantize(Decimal("0.0001")), Decimal("100.0000"))
 
     topics = tuple(
@@ -1180,6 +1345,8 @@ def score_candidate(
         "recent_titles": candidate.recent_titles,
         "gdelt_titles": candidate.gdelt_titles,
         "sec_titles": candidate.sec_titles,
+        "reddit_post_uids": sorted(candidate.reddit_post_uids)[:20],
+        "reddit_comment_count": candidate.reddit_comment_count,
         "sec_forms": dict(candidate.sec_forms),
         "topic_counts": dict(candidate.topic_counts),
         "topic_scores": dict(candidate.topic_scores),
@@ -1199,11 +1366,13 @@ def score_candidate(
         news_score=news_score.quantize(Decimal("0.0001")),
         gdelt_score=gdelt_score.quantize(Decimal("0.0001")),
         sec_score=sec_score.quantize(Decimal("0.0001")),
+        reddit_score=reddit_score.quantize(Decimal("0.0001")),
         fundamental_score=fact_score.quantize(Decimal("0.0001")),
         liquidity_score=liquidity_score.quantize(Decimal("0.0001")),
         finnhub_article_count=news_count,
         gdelt_article_count=gdelt_count,
         sec_filing_count=sec_count,
+        reddit_post_count=reddit_count,
         latest_news_at=candidate.latest_news_at,
         latest_filing_date=candidate.latest_filing_date,
         action_bias=action_bias,
@@ -1224,7 +1393,15 @@ def rank_candidates(
         or candidate.gdelt_article_urls
         or candidate.sec_accessions
     ]
-    scored.sort(key=lambda item: (item.score, item.sec_filing_count, item.finnhub_article_count), reverse=True)
+    scored.sort(
+        key=lambda item: (
+            item.score,
+            item.sec_filing_count,
+            item.finnhub_article_count,
+            item.reddit_post_count,
+        ),
+        reverse=True,
+    )
     ranked: list[CandidateScore] = []
     for index, score in enumerate(scored[:top_n], start=1):
         ranked.append(
@@ -1239,11 +1416,13 @@ def rank_candidates(
                 news_score=score.news_score,
                 gdelt_score=score.gdelt_score,
                 sec_score=score.sec_score,
+                reddit_score=score.reddit_score,
                 fundamental_score=score.fundamental_score,
                 liquidity_score=score.liquidity_score,
                 finnhub_article_count=score.finnhub_article_count,
                 gdelt_article_count=score.gdelt_article_count,
                 sec_filing_count=score.sec_filing_count,
+                reddit_post_count=score.reddit_post_count,
                 latest_news_at=score.latest_news_at,
                 latest_filing_date=score.latest_filing_date,
                 action_bias=score.action_bias,
@@ -1319,11 +1498,13 @@ def upsert_candidate_scores(conn: Connection, scores: tuple[CandidateScore, ...]
                 news_score,
                 gdelt_score,
                 sec_score,
+                reddit_score,
                 fundamental_score,
                 liquidity_score,
                 finnhub_article_count,
                 gdelt_article_count,
                 sec_filing_count,
+                reddit_post_count,
                 latest_news_at,
                 latest_filing_date,
                 action_bias,
@@ -1332,7 +1513,8 @@ def upsert_candidate_scores(conn: Connection, scores: tuple[CandidateScore, ...]
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, now()
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, now()
             )
             ON CONFLICT (run_date, ticker)
             DO UPDATE SET
@@ -1344,11 +1526,13 @@ def upsert_candidate_scores(conn: Connection, scores: tuple[CandidateScore, ...]
                 news_score = EXCLUDED.news_score,
                 gdelt_score = EXCLUDED.gdelt_score,
                 sec_score = EXCLUDED.sec_score,
+                reddit_score = EXCLUDED.reddit_score,
                 fundamental_score = EXCLUDED.fundamental_score,
                 liquidity_score = EXCLUDED.liquidity_score,
                 finnhub_article_count = EXCLUDED.finnhub_article_count,
                 gdelt_article_count = EXCLUDED.gdelt_article_count,
                 sec_filing_count = EXCLUDED.sec_filing_count,
+                reddit_post_count = EXCLUDED.reddit_post_count,
                 latest_news_at = EXCLUDED.latest_news_at,
                 latest_filing_date = EXCLUDED.latest_filing_date,
                 action_bias = EXCLUDED.action_bias,
@@ -1367,11 +1551,13 @@ def upsert_candidate_scores(conn: Connection, scores: tuple[CandidateScore, ...]
                 score.news_score,
                 score.gdelt_score,
                 score.sec_score,
+                score.reddit_score,
                 score.fundamental_score,
                 score.liquidity_score,
                 score.finnhub_article_count,
                 score.gdelt_article_count,
                 score.sec_filing_count,
+                score.reddit_post_count,
                 score.latest_news_at,
                 score.latest_filing_date,
                 score.action_bias,
@@ -1439,6 +1625,7 @@ def candidate_to_dict(candidate: CandidateScore) -> dict[str, Any]:
             "news": str(candidate.news_score),
             "gdelt": str(candidate.gdelt_score),
             "sec": str(candidate.sec_score),
+            "reddit": str(candidate.reddit_score),
             "fundamental": str(candidate.fundamental_score),
             "liquidity": str(candidate.liquidity_score),
         },
@@ -1446,6 +1633,7 @@ def candidate_to_dict(candidate: CandidateScore) -> dict[str, Any]:
             "finnhub_articles": candidate.finnhub_article_count,
             "gdelt_articles": candidate.gdelt_article_count,
             "sec_filings": candidate.sec_filing_count,
+            "reddit_posts": candidate.reddit_post_count,
         },
         "latest_news_at": candidate.latest_news_at.isoformat()
         if candidate.latest_news_at
@@ -1477,12 +1665,16 @@ def run_daily_discovery(
     gdelt_max_records: int = gdelt.DEFAULT_MAX_RECORDS,
     finnhub_categories: tuple[str, ...] = DEFAULT_FINNHUB_CATEGORIES,
     incremental_finnhub: bool = True,
+    reddit_subreddits: tuple[str, ...] = DEFAULT_REDDIT_SUBREDDITS,
+    reddit_listing: str = DEFAULT_REDDIT_LISTING,
+    reddit_limit: int = DEFAULT_REDDIT_LIMIT,
     max_sec_tickers: int = DEFAULT_MAX_SEC_TICKERS,
     sec_filing_limit: int = DEFAULT_SEC_FILING_LIMIT,
     include_company_facts: bool = False,
     fact_limit: int | None = None,
     skip_finnhub_sync: bool = False,
     skip_gdelt_sync: bool = False,
+    skip_reddit_sync: bool = False,
     skip_sec_sync: bool = False,
     top_n: int = DEFAULT_TOP_N,
 ) -> DailyDiscoveryResult:
@@ -1515,6 +1707,14 @@ def run_daily_discovery(
             max_records=gdelt_max_records,
             warnings=warnings,
         )
+    if not skip_reddit_sync:
+        stats["reddit_sync"] = maybe_sync_reddit_subreddits(
+            database_url=database_url,
+            subreddits=reddit_subreddits,
+            listing=reddit_listing,
+            limit=reddit_limit,
+            warnings=warnings,
+        )
     if not skip_sec_sync:
         stats["sec_sync"] = maybe_sync_sec_filings(
             database_url=database_url,
@@ -1535,6 +1735,7 @@ def run_daily_discovery(
         fact_counts = fetch_fact_counts(conn)
         finnhub_articles = fetch_recent_finnhub_articles(conn, lookback_hours=lookback_hours)
         gdelt_articles = fetch_recent_gdelt_articles(conn, lookback_hours=lookback_hours)
+        reddit_posts = fetch_recent_reddit_posts(conn, lookback_hours=lookback_hours)
         sec_filings = fetch_recent_sec_filings(conn, lookback_days=lookback_days)
 
         mentions.extend(
@@ -1568,6 +1769,14 @@ def run_daily_discovery(
                 candidates=candidates,
             )
         )
+        mentions.extend(
+            build_reddit_mentions(
+                posts=reddit_posts,
+                topics=topics,
+                universe=universe,
+                candidates=candidates,
+            )
+        )
 
         for ticker, fact_count in fact_counts.items():
             if ticker in candidates:
@@ -1580,6 +1789,7 @@ def run_daily_discovery(
                 "stock_universe": len(universe),
                 "recent_finnhub_articles": len(finnhub_articles),
                 "recent_gdelt_articles": len(gdelt_articles),
+                "recent_reddit_posts": len(reddit_posts),
                 "recent_sec_filings": len(sec_filings),
                 "topic_mentions": len(mentions),
                 "candidate_count": len(scores),
@@ -1618,7 +1828,8 @@ def render_result(result: DailyDiscoveryResult) -> str:
                 f"{candidate.rank:>2}. {candidate.ticker:<8} "
                 f"score={candidate.score} action={candidate.action_bias} "
                 f"topic={topics} news={candidate.finnhub_article_count} "
-                f"gdelt={candidate.gdelt_article_count} sec={candidate.sec_filing_count}"
+                f"gdelt={candidate.gdelt_article_count} "
+                f"reddit={candidate.reddit_post_count} sec={candidate.sec_filing_count}"
             )
     return "\n".join(lines)
 
@@ -1637,12 +1848,26 @@ def add_daily_args(parser: argparse.ArgumentParser) -> None:
         help="Finnhub market news 分类，可重复传入，默认 general 和 merger",
     )
     parser.add_argument("--no-incremental-finnhub", action="store_true")
+    parser.add_argument(
+        "--reddit-subreddit",
+        action="append",
+        dest="reddit_subreddits",
+        help="Reddit subreddit，可重复传入，默认 stocks/investing/wallstreetbets/SecurityAnalysis",
+    )
+    parser.add_argument(
+        "--reddit-listing",
+        default=DEFAULT_REDDIT_LISTING,
+        choices=sorted(reddit.VALID_LISTINGS),
+        help="Reddit listing 类型",
+    )
+    parser.add_argument("--reddit-limit", type=int, default=DEFAULT_REDDIT_LIMIT)
     parser.add_argument("--max-sec-tickers", type=int, default=DEFAULT_MAX_SEC_TICKERS)
     parser.add_argument("--sec-filing-limit", type=int, default=DEFAULT_SEC_FILING_LIMIT)
     parser.add_argument("--include-company-facts", action="store_true")
     parser.add_argument("--fact-limit", type=int)
     parser.add_argument("--skip-finnhub-sync", action="store_true")
     parser.add_argument("--skip-gdelt-sync", action="store_true")
+    parser.add_argument("--skip-reddit-sync", action="store_true")
     parser.add_argument("--skip-sec-sync", action="store_true")
     parser.add_argument("--skip-sync", action="store_true", help="跳过所有外部同步，仅使用库内已有数据评分")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
@@ -1707,6 +1932,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_from_args(args: argparse.Namespace) -> DailyDiscoveryResult:
     skip_all = bool(args.skip_sync)
     categories = tuple(args.finnhub_categories or DEFAULT_FINNHUB_CATEGORIES)
+    reddit_subreddits = tuple(args.reddit_subreddits or DEFAULT_REDDIT_SUBREDDITS)
     return run_daily_discovery(
         database_url=args.database_url,
         run_date=parse_run_date(args.run_date),
@@ -1716,12 +1942,16 @@ def run_from_args(args: argparse.Namespace) -> DailyDiscoveryResult:
         gdelt_max_records=args.gdelt_max_records,
         finnhub_categories=categories,
         incremental_finnhub=not args.no_incremental_finnhub,
+        reddit_subreddits=reddit_subreddits,
+        reddit_listing=args.reddit_listing,
+        reddit_limit=args.reddit_limit,
         max_sec_tickers=args.max_sec_tickers,
         sec_filing_limit=args.sec_filing_limit,
         include_company_facts=args.include_company_facts,
         fact_limit=args.fact_limit,
         skip_finnhub_sync=skip_all or args.skip_finnhub_sync,
         skip_gdelt_sync=skip_all or args.skip_gdelt_sync,
+        skip_reddit_sync=skip_all or args.skip_reddit_sync,
         skip_sec_sync=skip_all or args.skip_sec_sync,
         top_n=args.top_n,
     )

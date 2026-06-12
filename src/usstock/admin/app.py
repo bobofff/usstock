@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
+import json
 import sys
 import threading
 import traceback
@@ -22,7 +24,7 @@ from psycopg.rows import dict_row
 
 from usstock.config.settings import get_settings
 from usstock.data import finnhub
-from usstock.data import gdelt, sec
+from usstock.data import gdelt, reddit, sec
 from usstock.discovery import daily as discovery
 from usstock.discovery import topic_candidates
 
@@ -31,6 +33,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 PAGE_SIZE = 100
 MAX_POST_BYTES = 64 * 1024
+MAX_JSON_POST_BYTES = 4 * 1024 * 1024
 PICO_CSS_URL = "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
 HTMX_JS_URL = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
 ALPINE_JS_URL = "https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"
@@ -46,6 +49,7 @@ class DiscoveryRunConfig:
     include_company_facts: bool
     skip_finnhub_sync: bool
     skip_gdelt_sync: bool
+    skip_reddit_sync: bool
     skip_sec_sync: bool
 
 
@@ -205,6 +209,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "/sec": render_sec_filings,
             "/gdelt": render_gdelt,
             "/finnhub": render_finnhub,
+            "/reddit": render_reddit,
             "/topics": render_topics,
             "/tasks": render_tasks,
         }
@@ -224,11 +229,27 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length", "0") or "0")
-        if length > MAX_POST_BYTES:
+        max_post_bytes = (
+            MAX_JSON_POST_BYTES
+            if parsed.path == "/api/reddit/devvit/posts"
+            else MAX_POST_BYTES
+        )
+        if length > max_post_bytes:
+            if parsed.path == "/api/reddit/devvit/posts":
+                self.send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"ok": False, "error": "请求内容过大。"},
+                )
+                return
             self.redirect("/tasks", "请求内容过大。", ok=False)
             return
 
-        raw_body = self.rfile.read(length).decode("utf-8")
+        raw_bytes = self.rfile.read(length)
+        if parsed.path == "/api/reddit/devvit/posts":
+            self.handle_devvit_reddit_posts(raw_bytes)
+            return
+
+        raw_body = raw_bytes.decode("utf-8")
         form = urllib.parse.parse_qs(raw_body)
 
         try:
@@ -335,6 +356,45 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path == "/actions/reddit-defaults":
+                listing = form_value(form, "listing") or reddit.DEFAULT_LISTING
+                limit = parse_positive_int(form_value(form, "limit")) or 50
+                counts = reddit.sync_default_subreddits(
+                    listing=listing,
+                    limit=limit,
+                    database_url=database_url,
+                )
+                total = sum(counts.values())
+                detail = "，".join(f"r/{name}={count}" for name, count in counts.items())
+                self.redirect(
+                    "/reddit",
+                    f"Reddit 默认社区同步完成：{total} 条。{detail}",
+                    ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/reddit-subreddit":
+                subreddit = form_value(form, "subreddit")
+                if not subreddit:
+                    raise AdminPanelError("subreddit 不能为空。")
+
+                listing = form_value(form, "listing") or reddit.DEFAULT_LISTING
+                limit = parse_positive_int(form_value(form, "limit")) or 50
+                time_filter = form_value(form, "time_filter") or None
+                count = reddit.sync_subreddit_posts(
+                    subreddit=subreddit,
+                    listing=listing,
+                    limit=limit,
+                    time_filter=time_filter,
+                    database_url=database_url,
+                )
+                self.redirect(
+                    "/reddit",
+                    f"Reddit r/{reddit.normalize_subreddit(subreddit)} 同步完成：{count} 条。",
+                    ok=True,
+                )
+                return
+
             if parsed.path == "/actions/discovery-daily":
                 config = parse_discovery_run_config(form)
                 result = run_discovery_daily(database_url, config)
@@ -410,6 +470,44 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.redirect("/tasks", f"操作失败：{exc}", ok=False)
 
+    def handle_devvit_reddit_posts(self, raw_body: bytes) -> None:
+        try:
+            self.authorize_devvit_webhook()
+            payload = json.loads(raw_body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise AdminPanelError("Devvit payload 必须是 JSON 对象。")
+            count = reddit.ingest_devvit_payload(
+                payload,
+                database_url=self.resolve_database_url(),
+            )
+            self.send_json(HTTPStatus.OK, {"ok": True, "imported": count})
+        except json.JSONDecodeError as exc:
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": f"JSON 解析失败：{exc}"},
+            )
+        except PermissionError as exc:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # pragma: no cover - API safety net.
+            traceback.print_exc()
+            self.send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": str(exc)},
+            )
+
+    def authorize_devvit_webhook(self) -> None:
+        secret = get_settings().reddit_devvit_webhook_secret
+        if not secret:
+            raise PermissionError("缺少 REDDIT_DEVVIT_WEBHOOK_SECRET，拒绝 Devvit webhook。")
+
+        auth_header = self.headers.get("Authorization", "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        token = token or self.headers.get("X-Usstock-Webhook-Secret", "").strip()
+        if not hmac.compare_digest(token, secret):
+            raise PermissionError("Devvit webhook 密钥无效。")
+
     def resolve_database_url(self) -> str | None:
         return self.server.database_url
 
@@ -428,6 +526,14 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def send_json(self, status: HTTPStatus, body: dict[str, Any]) -> None:
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -454,6 +560,24 @@ def connect_database(database_url: str | None) -> Connection[dict[str, Any]]:
 def table_exists(conn: Connection[dict[str, Any]], table_name: str) -> bool:
     row = conn.execute("SELECT to_regclass(%s) AS table_name", (table_name,)).fetchone()
     return bool(row and row["table_name"])
+
+
+def column_exists(
+    conn: Connection[dict[str, Any]],
+    table_name: str,
+    column_name: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (table_name, column_name),
+    ).fetchone()
+    return bool(row)
 
 
 def fetch_one(
@@ -488,6 +612,8 @@ def render_dashboard(
                 "gdelt_doc_queries": table_exists(conn, "gdelt_doc_queries"),
                 "finnhub_articles": table_exists(conn, "finnhub_articles"),
                 "finnhub_news_queries": table_exists(conn, "finnhub_news_queries"),
+                "reddit_posts": table_exists(conn, "reddit_posts"),
+                "reddit_post_queries": table_exists(conn, "reddit_post_queries"),
                 "market_topics": table_exists(conn, "market_topics"),
                 "market_topic_candidates": table_exists(conn, "market_topic_candidates"),
                 "topic_mentions": table_exists(conn, "topic_mentions"),
@@ -568,6 +694,28 @@ def render_dashboard(
             finnhub_query_summary = (
                 fetch_one(conn, "SELECT count(*) AS total FROM finnhub_news_queries")
                 if tables["finnhub_news_queries"]
+                else {}
+            )
+            reddit_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (
+                            WHERE created_utc >= now() - interval '24 hours'
+                        ) AS recent,
+                        count(DISTINCT subreddit) AS subreddits,
+                        max(created_utc) AS latest_created_at
+                    FROM reddit_posts
+                    """,
+                )
+                if tables["reddit_posts"]
+                else {}
+            )
+            reddit_query_summary = (
+                fetch_one(conn, "SELECT count(*) AS total FROM reddit_post_queries")
+                if tables["reddit_post_queries"]
                 else {}
             )
             topic_summary = (
@@ -669,6 +817,20 @@ def render_dashboard(
                 if tables["finnhub_articles"]
                 else []
             )
+            recent_reddit_posts = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT title, subreddit, candidate_tickers, score,
+                           comment_count, created_utc, permalink_url
+                    FROM reddit_posts
+                    ORDER BY coalesce(created_utc, last_seen_at) DESC
+                    LIMIT 8
+                    """,
+                )
+                if tables["reddit_posts"]
+                else []
+            )
     except Exception as exc:
         return render_database_error(exc, active="/")
 
@@ -701,6 +863,16 @@ def render_dashboard(
             "market / company",
         ),
         metric_box(
+            "Reddit 帖子",
+            reddit_summary.get("total"),
+            f"近 24 小时 {fmt(reddit_summary.get('recent'))}",
+        ),
+        metric_box(
+            "Reddit 查询",
+            reddit_query_summary.get("total"),
+            f"社区 {fmt(reddit_summary.get('subreddits'))}",
+        ),
+        metric_box(
             "主题",
             topic_summary.get("total"),
             f"启用 {fmt(topic_summary.get('active'))} / 24h 提及 {fmt(topic_mention_summary.get('recent'))}",
@@ -730,6 +902,10 @@ def render_dashboard(
       <div>
         <h2>最近 Finnhub 新闻</h2>
         {render_finnhub_articles_table(recent_finnhub_articles, compact=True)}
+      </div>
+      <div>
+        <h2>最近 Reddit 帖子</h2>
+        {render_reddit_posts_table(recent_reddit_posts, compact=True)}
       </div>
     </section>
     <section>
@@ -1168,6 +1344,216 @@ def render_finnhub(
     return layout("Finnhub", body, active="/finnhub", query=query)
 
 
+def render_reddit(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+) -> str:
+    q = form_value(query, "q")
+    subreddit_filter = form_value(query, "subreddit")
+    ticker = form_value(query, "ticker").upper()
+    settings = get_settings()
+
+    try:
+        with connect_database(database_url) as conn:
+            has_posts = table_exists(conn, "reddit_posts")
+            has_queries = table_exists(conn, "reddit_post_queries")
+            summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (
+                            WHERE created_utc >= now() - interval '24 hours'
+                        ) AS recent,
+                        count(DISTINCT subreddit) AS subreddits,
+                        sum(comment_count) AS comments,
+                        max(created_utc) AS latest_created_at
+                    FROM reddit_posts
+                    """,
+                )
+                if has_posts
+                else {}
+            )
+            subreddit_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT subreddit AS label,
+                           count(*) AS total,
+                           max(created_utc) AS latest_at
+                    FROM reddit_posts
+                    GROUP BY subreddit
+                    ORDER BY total DESC, label
+                    LIMIT 12
+                    """,
+                )
+                if has_posts
+                else []
+            )
+            ticker_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT ticker AS label,
+                           count(*) AS total,
+                           max(created_utc) AS latest_at
+                    FROM reddit_posts
+                    CROSS JOIN LATERAL unnest(candidate_tickers) AS ticker
+                    GROUP BY ticker
+                    ORDER BY total DESC, label
+                    LIMIT 12
+                    """,
+                )
+                if has_posts
+                else []
+            )
+            post_conditions: list[str] = []
+            post_params: list[Any] = []
+            query_conditions: list[str] = []
+            query_params: list[Any] = []
+            if q:
+                like = f"%{q}%"
+                post_conditions.append(
+                    """
+                    (
+                        title ILIKE %s OR coalesce(selftext, '') ILIKE %s
+                        OR coalesce(link_flair_text, '') ILIKE %s
+                    )
+                    """
+                )
+                post_params.extend([like, like, like])
+            if subreddit_filter:
+                post_conditions.append("lower(subreddit) = lower(%s)")
+                post_params.append(subreddit_filter)
+                query_conditions.append("lower(subreddit) = lower(%s)")
+                query_params.append(subreddit_filter)
+            if ticker:
+                post_conditions.append("%s = ANY(candidate_tickers)")
+                post_params.append(ticker)
+
+            post_where = (
+                f"WHERE {' AND '.join(post_conditions)}"
+                if post_conditions
+                else ""
+            )
+            query_where = (
+                f"WHERE {' AND '.join(query_conditions)}" if query_conditions else ""
+            )
+            posts = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT title, subreddit, candidate_tickers, candidate_keywords,
+                           score, upvote_ratio, comment_count, created_utc,
+                           permalink_url, link_flair_text
+                    FROM reddit_posts
+                    {post_where}
+                    ORDER BY coalesce(created_utc, last_seen_at) DESC
+                    LIMIT %s
+                    """,
+                    (*post_params, PAGE_SIZE),
+                )
+                if has_posts
+                else []
+            )
+            queries = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT subreddit, listing, time_filter, limit_count,
+                           after_token, fetched_at
+                    FROM reddit_post_queries
+                    {query_where}
+                    ORDER BY fetched_at DESC
+                    LIMIT 20
+                    """,
+                    tuple(query_params),
+                )
+                if has_queries
+                else []
+            )
+    except Exception as exc:
+        return render_database_error(exc, active="/reddit")
+
+    metrics = [
+        metric_box(
+            "Client ID",
+            "已配置" if settings.reddit_client_id else "未配置",
+            "REDDIT_CLIENT_ID",
+        ),
+        metric_box(
+            "User-Agent",
+            "已配置" if settings.reddit_user_agent else "未配置",
+            "REDDIT_USER_AGENT",
+        ),
+        metric_box("帖子总数", summary.get("total"), "reddit_post"),
+        metric_box("近 24 小时", summary.get("recent"), "created_utc"),
+        metric_box(
+            "社区 / 评论",
+            f"{fmt(summary.get('subreddits'))} / {fmt(summary.get('comments'))}",
+            f"最近 {fmt(summary.get('latest_created_at'))}",
+        ),
+    ]
+    listing_options = render_select_options(
+        sorted(reddit.VALID_LISTINGS),
+        reddit.DEFAULT_LISTING,
+    )
+    time_filter_options = render_select_options(
+        sorted(reddit.VALID_TIME_FILTERS),
+        reddit.DEFAULT_TIME_FILTER,
+    )
+    body = f"""
+    <section class="toolbar">
+      <h1>Reddit</h1>
+      <form method="get" class="filters">
+        <input name="q" value="{e(q)}" placeholder="关键词 / flair">
+        <input name="subreddit" value="{e(subreddit_filter)}" placeholder="subreddit">
+        <input name="ticker" value="{e(ticker)}" placeholder="ticker">
+        <button type="submit">筛选</button>
+      </form>
+    </section>
+    <section class="metrics">{"".join(metrics)}</section>
+    <section class="task-grid">
+      <form method="post" action="/actions/reddit-defaults">
+        <h2>默认投资社区</h2>
+        <p>同步 stocks、investing、wallstreetbets、SecurityAnalysis，用作低权重社区讨论信号。</p>
+        <label>listing <select name="listing">{listing_options}</select></label>
+        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
+        <button class="primary" type="submit">同步默认社区</button>
+      </form>
+      <form method="post" action="/actions/reddit-subreddit">
+        <h2>单个 subreddit</h2>
+        <label>subreddit <input name="subreddit" required placeholder="stocks" value="{e(subreddit_filter)}"></label>
+        <label>listing <select name="listing">{listing_options}</select></label>
+        <label>time filter <select name="time_filter">{time_filter_options}</select></label>
+        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
+        <button class="primary" type="submit">同步社区</button>
+      </form>
+    </section>
+    <section class="split">
+      <div>
+        <h2>社区概览</h2>
+        {render_reddit_breakdown_table(subreddit_rows, empty_message="暂无 Reddit 社区统计。")}
+      </div>
+      <div>
+        <h2>候选 ticker</h2>
+        {render_reddit_breakdown_table(ticker_rows, empty_message="暂无 Reddit ticker 统计。")}
+      </div>
+    </section>
+    <section>
+      <h2>查询记录</h2>
+      {render_reddit_queries_table(queries)}
+    </section>
+    <section>
+      <h2>社区帖子</h2>
+      {render_reddit_posts_table(posts)}
+    </section>
+    """
+    return layout("Reddit", body, active="/reddit", query=query)
+
+
 def render_topics(
     *,
     database_url: str | None,
@@ -1183,6 +1569,11 @@ def render_topics(
             has_topic_candidates = table_exists(conn, "market_topic_candidates")
             has_mentions = table_exists(conn, "topic_mentions")
             has_scores = table_exists(conn, "daily_candidate_scores")
+            has_reddit_score_columns = has_scores and column_exists(
+                conn,
+                "daily_candidate_scores",
+                "reddit_post_count",
+            )
 
             summary = (
                 fetch_one(
@@ -1398,6 +1789,11 @@ def render_topics(
             score_where = (
                 f"WHERE {' AND '.join(score_conditions)}" if score_conditions else ""
             )
+            reddit_count_expr = (
+                "reddit_post_count"
+                if has_reddit_score_columns
+                else "0 AS reddit_post_count"
+            )
             score_rows = (
                 fetch_all(
                     conn,
@@ -1405,7 +1801,7 @@ def render_topics(
                     SELECT run_date, rank, ticker, company_name, score,
                            action_bias, primary_topic_slug, topic_slugs,
                            finnhub_article_count, gdelt_article_count,
-                           sec_filing_count
+                           sec_filing_count, {reddit_count_expr}
                     FROM daily_candidate_scores
                     {score_where}
                     ORDER BY run_date DESC, rank NULLS LAST, score DESC
@@ -1507,7 +1903,7 @@ def render_tasks(
     <section class="task-grid">
       <form method="post" action="/actions/discovery-daily">
         <h2>自动热点发现</h2>
-        <p>按主题库同步 GDELT，拉取 Finnhub 市场新闻，扫描 SEC filings，并生成每日候选股评分。</p>
+        <p>按主题库同步 GDELT，拉取 Finnhub 市场新闻，读取 Reddit 社区信号，扫描 SEC filings，并生成每日候选股评分。</p>
         <label>候选数量 <input name="top_n" type="number" min="1" value="{discovery.DEFAULT_TOP_N}"></label>
         <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{discovery.DEFAULT_LOOKBACK_HOURS}"></label>
         <label>GDELT 文章数 <input name="gdelt_max_records" type="number" min="1" max="250" value="{gdelt.DEFAULT_MAX_RECORDS}"></label>
@@ -1517,6 +1913,7 @@ def render_tasks(
         <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
         <label><input type="checkbox" name="skip_finnhub_sync" value="1"> 跳过 Finnhub</label>
         <label><input type="checkbox" name="skip_gdelt_sync" value="1"> 跳过 GDELT</label>
+        <label><input type="checkbox" name="skip_reddit_sync" value="1"> 跳过 Reddit</label>
         <label><input type="checkbox" name="skip_sec_sync" value="1"> 跳过 SEC</label>
         <div class="button-row">
           <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
@@ -1567,6 +1964,21 @@ def render_tasks(
         <label>开始日期 <input name="from_date" type="date" value="{week_ago.isoformat()}"></label>
         <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}"></label>
         <button class="primary" type="submit">同步个股新闻</button>
+      </form>
+      <form method="post" action="/actions/reddit-defaults">
+        <h2>Reddit 默认社区</h2>
+        <p>同步投资社区帖子，作为候选股评分中的低权重讨论热度信号。</p>
+        <label>listing <select name="listing">{render_select_options(sorted(reddit.VALID_LISTINGS), reddit.DEFAULT_LISTING)}</select></label>
+        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
+        <button class="primary" type="submit">同步默认社区</button>
+      </form>
+      <form method="post" action="/actions/reddit-subreddit">
+        <h2>Reddit 单个社区</h2>
+        <label>subreddit <input name="subreddit" required placeholder="stocks"></label>
+        <label>listing <select name="listing">{render_select_options(sorted(reddit.VALID_LISTINGS), reddit.DEFAULT_LISTING)}</select></label>
+        <label>time filter <select name="time_filter">{render_select_options(sorted(reddit.VALID_TIME_FILTERS), reddit.DEFAULT_TIME_FILTER)}</select></label>
+        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
+        <button class="primary" type="submit">同步社区</button>
       </form>
     </section>
     """
@@ -1638,6 +2050,7 @@ def parse_discovery_run_config(
         include_company_facts=form_bool(form, "include_company_facts"),
         skip_finnhub_sync=form_bool(form, "skip_finnhub_sync"),
         skip_gdelt_sync=form_bool(form, "skip_gdelt_sync"),
+        skip_reddit_sync=form_bool(form, "skip_reddit_sync"),
         skip_sec_sync=form_bool(form, "skip_sec_sync"),
     )
 
@@ -1656,6 +2069,7 @@ def run_discovery_daily(
         include_company_facts=config.include_company_facts,
         skip_finnhub_sync=config.skip_finnhub_sync,
         skip_gdelt_sync=config.skip_gdelt_sync,
+        skip_reddit_sync=config.skip_reddit_sync,
         skip_sec_sync=config.skip_sec_sync,
     )
 
@@ -1873,6 +2287,62 @@ def render_finnhub_articles_table(
     return table(head, "".join(body))
 
 
+def render_reddit_posts_table(
+    rows: list[dict[str, Any]],
+    *,
+    compact: bool = False,
+) -> str:
+    if not rows:
+        return empty_state("暂无 Reddit 帖子。")
+
+    body = []
+    for row in rows:
+        title = e(clip_text(str(row.get("title") or ""), 120))
+        url = row.get("permalink_url")
+        if url:
+            title = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{title}</a>'
+        tickers = format_ticker_list(row.get("candidate_tickers"))
+        metrics = (
+            f"score {fmt(row.get('score'))}"
+            f" / 评论 {fmt(row.get('comment_count'))}"
+        )
+        if compact:
+            body.append(
+                f"""
+                <tr>
+                  <td>{title}<div class="subtle">r/{e(row.get("subreddit"))}</div></td>
+                  <td>{tickers}</td>
+                  <td>{metrics}</td>
+                  <td>{fmt(row.get("created_utc"))}</td>
+                </tr>
+                """
+            )
+        else:
+            body.append(
+                f"""
+                <tr>
+                  <td>{title}<div class="subtle">{e(row.get("link_flair_text"))}</div></td>
+                  <td>r/{e(row.get("subreddit"))}</td>
+                  <td>{tickers}</td>
+                  <td>{format_list(row.get("candidate_keywords"), limit=6)}</td>
+                  <td>{fmt(row.get("score"))}</td>
+                  <td>{fmt(row.get("upvote_ratio"))}</td>
+                  <td>{fmt(row.get("comment_count"))}</td>
+                  <td>{fmt(row.get("created_utc"))}</td>
+                </tr>
+                """
+            )
+
+    if compact:
+        head = "<tr><th>标题</th><th>ticker</th><th>热度</th><th>时间</th></tr>"
+    else:
+        head = (
+            "<tr><th>标题</th><th>社区</th><th>ticker</th><th>关键词</th>"
+            "<th>score</th><th>赞同比</th><th>评论</th><th>时间</th></tr>"
+        )
+    return table(head, "".join(body))
+
+
 def render_topics_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_state("暂无主题库记录。")
@@ -2057,6 +2527,7 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
               <td>{format_list(row.get("topic_slugs"), limit=5)}</td>
               <td>{fmt(row.get("finnhub_article_count"))}</td>
               <td>{fmt(row.get("gdelt_article_count"))}</td>
+              <td>{fmt(row.get("reddit_post_count"))}</td>
               <td>{fmt(row.get("sec_filing_count"))}</td>
             </tr>
             """
@@ -2065,7 +2536,7 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
         (
             "<tr><th>日期</th><th>排名</th><th>ticker</th><th>评分</th>"
             "<th>动作</th><th>主主题</th><th>主题</th>"
-            "<th>Finnhub</th><th>GDELT</th><th>SEC</th></tr>"
+            "<th>Finnhub</th><th>GDELT</th><th>Reddit</th><th>SEC</th></tr>"
         ),
         "".join(body),
     )
@@ -2124,6 +2595,31 @@ def render_finnhub_breakdown_table(
     )
 
 
+def render_reddit_breakdown_table(
+    rows: list[dict[str, Any]],
+    *,
+    empty_message: str,
+) -> str:
+    if not rows:
+        return empty_state(empty_message)
+
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td>{e(row.get("label"))}</td>
+              <td>{fmt(row.get("total"))}</td>
+              <td>{fmt(row.get("latest_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        "<tr><th>名称</th><th>数量</th><th>最近帖子</th></tr>",
+        "".join(body),
+    )
+
+
 def render_gdelt_queries_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_state("暂无 GDELT 查询记录。")
@@ -2171,6 +2667,33 @@ def render_finnhub_queries_table(rows: list[dict[str, Any]]) -> str:
         (
             "<tr><th>endpoint</th><th>category</th><th>ticker</th>"
             "<th>开始</th><th>结束</th><th>minId</th><th>抓取时间</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_reddit_queries_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无 Reddit 查询记录。")
+
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td>r/{e(row.get("subreddit"))}</td>
+              <td>{e(row.get("listing"))}</td>
+              <td>{e(row.get("time_filter"))}</td>
+              <td>{fmt(row.get("limit_count"))}</td>
+              <td>{e(row.get("after_token"))}</td>
+              <td>{fmt(row.get("fetched_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>subreddit</th><th>listing</th><th>时间窗口</th>"
+            "<th>数量</th><th>after</th><th>抓取时间</th></tr>"
         ),
         "".join(body),
     )
@@ -2265,6 +2788,7 @@ def layout(
         ("/sec", "SEC", "公告与事实"),
         ("/gdelt", "GDELT", "全球新闻"),
         ("/finnhub", "Finnhub", "金融新闻"),
+        ("/reddit", "Reddit", "社区情绪"),
         ("/topics", "主题", "热点与评分"),
         ("/tasks", "同步", "数据任务"),
     ]
@@ -2996,6 +3520,16 @@ def clean_blank(value: str) -> str | None:
 
 def checked(value: bool) -> str:
     return "checked" if value else ""
+
+
+def render_select_options(options: list[str], selected: str) -> str:
+    return "".join(
+        (
+            f'<option value="{e(option)}"'
+            f'{" selected" if option == selected else ""}>{e(option)}</option>'
+        )
+        for option in options
+    )
 
 
 def clip_text(value: str, limit: int) -> str:
