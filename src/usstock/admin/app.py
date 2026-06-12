@@ -34,6 +34,10 @@ DEFAULT_PORT = 7878
 PAGE_SIZE = 100
 MAX_POST_BYTES = 64 * 1024
 MAX_JSON_POST_BYTES = 4 * 1024 * 1024
+DEVVIT_JSON_PATHS = {
+    "/api/reddit/devvit/posts",
+    "/api/reddit/devvit/matches",
+}
 PICO_CSS_URL = "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
 HTMX_JS_URL = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
 ALPINE_JS_URL = "https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"
@@ -231,11 +235,11 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         max_post_bytes = (
             MAX_JSON_POST_BYTES
-            if parsed.path == "/api/reddit/devvit/posts"
+            if parsed.path in DEVVIT_JSON_PATHS
             else MAX_POST_BYTES
         )
         if length > max_post_bytes:
-            if parsed.path == "/api/reddit/devvit/posts":
+            if parsed.path in DEVVIT_JSON_PATHS:
                 self.send_json(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     {"ok": False, "error": "请求内容过大。"},
@@ -247,6 +251,9 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         raw_bytes = self.rfile.read(length)
         if parsed.path == "/api/reddit/devvit/posts":
             self.handle_devvit_reddit_posts(raw_bytes)
+            return
+        if parsed.path == "/api/reddit/devvit/matches":
+            self.handle_devvit_reddit_matches(raw_bytes)
             return
 
         raw_body = raw_bytes.decode("utf-8")
@@ -481,6 +488,31 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 database_url=self.resolve_database_url(),
             )
             self.send_json(HTTPStatus.OK, {"ok": True, "imported": count})
+        except json.JSONDecodeError as exc:
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": f"JSON 解析失败：{exc}"},
+            )
+        except PermissionError as exc:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # pragma: no cover - API safety net.
+            traceback.print_exc()
+            self.send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": str(exc)},
+            )
+
+    def handle_devvit_reddit_matches(self, raw_body: bytes) -> None:
+        try:
+            self.authorize_devvit_webhook()
+            payload = json.loads(raw_body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise AdminPanelError("Devvit match payload 必须是 JSON 对象。")
+            counts = reddit.ingest_devvit_match_payload(
+                payload,
+                database_url=self.resolve_database_url(),
+            )
+            self.send_json(HTTPStatus.OK, {"ok": True, **counts})
         except json.JSONDecodeError as exc:
             self.send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -1358,6 +1390,7 @@ def render_reddit(
         with connect_database(database_url) as conn:
             has_posts = table_exists(conn, "reddit_posts")
             has_queries = table_exists(conn, "reddit_post_queries")
+            has_comments = table_exists(conn, "reddit_comments")
             summary = (
                 fetch_one(
                     conn,
@@ -1374,6 +1407,23 @@ def render_reddit(
                     """,
                 )
                 if has_posts
+                else {}
+            )
+            comment_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (
+                            WHERE coalesce(created_utc, last_seen_at, created_at)
+                                  >= now() - interval '24 hours'
+                        ) AS recent,
+                        max(coalesce(created_utc, last_seen_at, created_at)) AS latest_at
+                    FROM reddit_comments
+                    """,
+                )
+                if has_comments
                 else {}
             )
             subreddit_rows = (
@@ -1411,6 +1461,8 @@ def render_reddit(
             )
             post_conditions: list[str] = []
             post_params: list[Any] = []
+            comment_conditions: list[str] = []
+            comment_params: list[Any] = []
             query_conditions: list[str] = []
             query_params: list[Any] = []
             if q:
@@ -1424,18 +1476,40 @@ def render_reddit(
                     """
                 )
                 post_params.extend([like, like, like])
+                comment_conditions.append(
+                    """
+                    (
+                        body ILIKE %s
+                        OR EXISTS (
+                            SELECT 1
+                            FROM unnest(matched_keywords) AS keyword
+                            WHERE keyword ILIKE %s
+                        )
+                    )
+                    """
+                )
+                comment_params.extend([like, like])
             if subreddit_filter:
                 post_conditions.append("lower(subreddit) = lower(%s)")
                 post_params.append(subreddit_filter)
+                comment_conditions.append("lower(subreddit) = lower(%s)")
+                comment_params.append(subreddit_filter)
                 query_conditions.append("lower(subreddit) = lower(%s)")
                 query_params.append(subreddit_filter)
             if ticker:
                 post_conditions.append("%s = ANY(candidate_tickers)")
                 post_params.append(ticker)
+                comment_conditions.append("%s = ANY(candidate_tickers)")
+                comment_params.append(ticker)
 
             post_where = (
                 f"WHERE {' AND '.join(post_conditions)}"
                 if post_conditions
+                else ""
+            )
+            comment_where = (
+                f"WHERE {' AND '.join(comment_conditions)}"
+                if comment_conditions
                 else ""
             )
             query_where = (
@@ -1456,6 +1530,23 @@ def render_reddit(
                     (*post_params, PAGE_SIZE),
                 )
                 if has_posts
+                else []
+            )
+            comments = (
+                fetch_all(
+                    conn,
+                    f"""
+                    SELECT body, subreddit, candidate_tickers, candidate_keywords,
+                           matched_keywords, score, created_utc, permalink_url,
+                           author_name, post_fullname
+                    FROM reddit_comments
+                    {comment_where}
+                    ORDER BY coalesce(created_utc, last_seen_at) DESC
+                    LIMIT %s
+                    """,
+                    (*comment_params, PAGE_SIZE),
+                )
+                if has_comments
                 else []
             )
             queries = (
@@ -1494,6 +1585,11 @@ def render_reddit(
             "社区 / 评论",
             f"{fmt(summary.get('subreddits'))} / {fmt(summary.get('comments'))}",
             f"最近 {fmt(summary.get('latest_created_at'))}",
+        ),
+        metric_box(
+            "实时评论命中",
+            comment_summary.get("total"),
+            f"近 24 小时 {fmt(comment_summary.get('recent'))}",
         ),
     ]
     listing_options = render_select_options(
@@ -1549,6 +1645,10 @@ def render_reddit(
     <section>
       <h2>社区帖子</h2>
       {render_reddit_posts_table(posts)}
+    </section>
+    <section>
+      <h2>实时命中评论</h2>
+      {render_reddit_comments_table(comments)}
     </section>
     """
     return layout("Reddit", body, active="/reddit", query=query)
@@ -2340,6 +2440,42 @@ def render_reddit_posts_table(
             "<tr><th>标题</th><th>社区</th><th>ticker</th><th>关键词</th>"
             "<th>score</th><th>赞同比</th><th>评论</th><th>时间</th></tr>"
         )
+    return table(head, "".join(body))
+
+
+def render_reddit_comments_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无 Devvit 实时命中评论。")
+
+    body = []
+    for row in rows:
+        comment = e(clip_text(str(row.get("body") or ""), 160))
+        url = row.get("permalink_url")
+        if url:
+            comment = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{comment}</a>'
+        body.append(
+            f"""
+            <tr>
+              <td>
+                {comment}
+                <div class="subtle">
+                  {e(row.get("author_name"))} / {e(row.get("post_fullname"))}
+                </div>
+              </td>
+              <td>r/{e(row.get("subreddit"))}</td>
+              <td>{format_list(row.get("matched_keywords"), limit=8)}</td>
+              <td>{format_ticker_list(row.get("candidate_tickers"))}</td>
+              <td>{format_list(row.get("candidate_keywords"), limit=6)}</td>
+              <td>{fmt(row.get("score"))}</td>
+              <td>{fmt(row.get("created_utc"))}</td>
+            </tr>
+            """
+        )
+
+    head = (
+        "<tr><th>评论</th><th>社区</th><th>命中词</th><th>ticker</th>"
+        "<th>关键词</th><th>score</th><th>时间</th></tr>"
+    )
     return table(head, "".join(body))
 
 

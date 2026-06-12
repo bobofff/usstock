@@ -33,6 +33,7 @@ VALID_TIME_FILTERS = {"hour", "day", "week", "month", "year", "all"}
 REDDIT_WEB_BASE_URL = "https://www.reddit.com"
 DEVVIT_REQUEST_BASE_URL = "devvit://reddit"
 SUBREDDIT_POSTS_ENDPOINT = "subreddit_posts"
+DEVVIT_TRIGGER_ENDPOINT = "devvit_trigger"
 
 TICKER_STOPWORDS = {
     "AI",
@@ -129,6 +130,28 @@ class RedditPost:
     link_flair_text: str | None
     candidate_tickers: list[str]
     candidate_keywords: list[str]
+    created_utc: datetime | None
+    source_type: str
+    query_uid: str
+    request_url: str
+    raw_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RedditComment:
+    comment_uid: str
+    reddit_id: str
+    fullname: str
+    post_fullname: str
+    parent_fullname: str | None
+    subreddit: str
+    body: str
+    author_name: str | None
+    permalink_url: str
+    score: int | None
+    candidate_tickers: list[str]
+    candidate_keywords: list[str]
+    matched_keywords: list[str]
     created_utc: datetime | None
     source_type: str
     query_uid: str
@@ -513,6 +536,31 @@ def build_devvit_request_url(
     )
 
 
+def build_devvit_trigger_request_url(*, trigger: str, thing_fullname: str) -> str:
+    safe_trigger = urllib.parse.quote(clean_optional_text(trigger) or "unknown")
+    safe_id = urllib.parse.quote(clean_optional_text(thing_fullname) or "unknown")
+    return f"{DEVVIT_REQUEST_BASE_URL}/trigger/{safe_trigger}/{safe_id}"
+
+
+def build_devvit_trigger_uid(
+    *,
+    trigger: str,
+    thing_fullname: str,
+    request_url: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "endpoint": DEVVIT_TRIGGER_ENDPOINT,
+            "trigger": clean_optional_text(trigger) or "unknown",
+            "thing_fullname": clean_optional_text(thing_fullname) or "",
+            "request_url": clean_optional_text(request_url) or "",
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _clean_fullname(value: Any) -> str | None:
     text = clean_optional_text(value)
     if not text:
@@ -520,6 +568,24 @@ def _clean_fullname(value: Any) -> str | None:
     if text.startswith("t3_"):
         return text
     return f"t3_{text}"
+
+
+def _clean_comment_fullname(value: Any) -> str | None:
+    text = clean_optional_text(value)
+    if not text:
+        return None
+    if text.startswith("t1_"):
+        return text
+    return f"t1_{text}"
+
+
+def _clean_thing_fullname(value: Any, *, default_prefix: str = "t3_") -> str | None:
+    text = clean_optional_text(value)
+    if not text:
+        return None
+    if re.fullmatch(r"t[1-9]_.+", text):
+        return text
+    return f"{default_prefix}{text}"
 
 
 def _extract_flair_text(value: Any) -> str | None:
@@ -600,6 +666,79 @@ def normalize_devvit_post_payload(
     }
 
 
+def normalize_devvit_comment_payload(
+    item: dict[str, Any],
+    *,
+    fallback_subreddit: str | None = None,
+    fallback_post: dict[str, Any] | None = None,
+    matched_keywords: list[str] | None = None,
+) -> dict[str, Any]:
+    """Convert a Devvit CommentV2-shaped payload to local comment fields."""
+
+    payload = item.get("data") if isinstance(item.get("data"), dict) else item
+    fullname = (
+        _clean_comment_fullname(payload.get("name"))
+        or _clean_comment_fullname(payload.get("fullname"))
+        or _clean_comment_fullname(payload.get("id"))
+        or _clean_comment_fullname(payload.get("commentId"))
+    )
+    reddit_id = clean_optional_text(payload.get("reddit_id") or payload.get("redditId"))
+    if not reddit_id and fullname:
+        reddit_id = fullname.removeprefix("t1_")
+
+    post_fullname = (
+        _clean_fullname(payload.get("post_fullname"))
+        or _clean_fullname(payload.get("postFullname"))
+        or _clean_fullname(payload.get("postId"))
+        or _clean_fullname(payload.get("post_id"))
+    )
+    if not post_fullname and fallback_post:
+        post_fullname = (
+            _clean_fullname(fallback_post.get("name"))
+            or _clean_fullname(fallback_post.get("fullname"))
+            or _clean_fullname(fallback_post.get("id"))
+            or _clean_fullname(fallback_post.get("postId"))
+        )
+
+    parent_fullname = (
+        _clean_thing_fullname(payload.get("parentFullname"))
+        or _clean_thing_fullname(payload.get("parent_fullname"))
+        or _clean_thing_fullname(payload.get("parentId"), default_prefix="t1_")
+    )
+
+    subreddit = (
+        clean_optional_text(payload.get("subreddit"))
+        or clean_optional_text(payload.get("subredditName"))
+        or fallback_subreddit
+    )
+    created_utc = (
+        payload.get("created_utc")
+        if payload.get("created_utc") is not None
+        else payload.get("createdAt", payload.get("created_at"))
+    )
+
+    return {
+        "id": reddit_id,
+        "name": fullname,
+        "post_fullname": post_fullname,
+        "parent_fullname": parent_fullname or post_fullname,
+        "subreddit": subreddit,
+        "body": clean_optional_text(payload.get("body")),
+        "author": clean_optional_text(
+            payload.get("author")
+            or payload.get("authorName")
+            or payload.get("author_name")
+        ),
+        "permalink": clean_optional_text(
+            payload.get("permalink") or payload.get("permalink_url")
+        ),
+        "score": payload.get("score"),
+        "created_utc": created_utc,
+        "matched_keywords": matched_keywords or [],
+        "raw_devvit_payload": payload,
+    }
+
+
 def build_post_uid(item: dict[str, Any]) -> str:
     fullname = clean_optional_text(item.get("name"))
     if fullname:
@@ -620,6 +759,28 @@ def build_post_uid(item: dict[str, Any]) -> str:
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"reddit:hash:{digest}"
+
+
+def build_comment_uid(item: dict[str, Any]) -> str:
+    fullname = clean_optional_text(item.get("name"))
+    if fullname:
+        return f"reddit:{fullname}"
+
+    reddit_id = clean_optional_text(item.get("id"))
+    if reddit_id:
+        return f"reddit:t1_{reddit_id}"
+
+    payload = json.dumps(
+        {
+            "body": clean_optional_text(item.get("body")),
+            "permalink": clean_optional_text(item.get("permalink")),
+            "created_utc": item.get("created_utc"),
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"reddit:comment:hash:{digest}"
 
 
 def extract_candidate_tickers(
@@ -723,6 +884,60 @@ def parse_post_payload(
     )
 
 
+def parse_comment_payload(
+    item: dict[str, Any],
+    *,
+    query_uid: str,
+    request_url: str,
+    fallback_subreddit: str | None = None,
+    known_tickers: set[str] | None = None,
+) -> RedditComment | None:
+    payload = item.get("data") if isinstance(item.get("data"), dict) else item
+    reddit_id = clean_optional_text(payload.get("id"))
+    fullname = clean_optional_text(payload.get("name")) or (
+        f"t1_{reddit_id}" if reddit_id else None
+    )
+    post_fullname = clean_optional_text(payload.get("post_fullname"))
+    body = clean_optional_text(payload.get("body"))
+    subreddit = clean_optional_text(payload.get("subreddit")) or fallback_subreddit
+    if not reddit_id or not fullname or not post_fullname or not body or not subreddit:
+        return None
+
+    permalink_url = normalize_permalink(payload.get("permalink"))
+    if not permalink_url:
+        return None
+
+    matched_keywords = [
+        str(item).strip()
+        for item in payload.get("matched_keywords", [])
+        if str(item).strip()
+    ] if isinstance(payload.get("matched_keywords"), list) else []
+
+    return RedditComment(
+        comment_uid=build_comment_uid(payload),
+        reddit_id=reddit_id,
+        fullname=fullname,
+        post_fullname=post_fullname,
+        parent_fullname=clean_optional_text(payload.get("parent_fullname")),
+        subreddit=normalize_subreddit(subreddit),
+        body=body,
+        author_name=clean_optional_text(payload.get("author")),
+        permalink_url=permalink_url,
+        score=parse_int(payload.get("score")),
+        candidate_tickers=extract_candidate_tickers(
+            body,
+            known_tickers=known_tickers,
+        ),
+        candidate_keywords=extract_keywords(body),
+        matched_keywords=matched_keywords,
+        created_utc=parse_utc_timestamp(payload.get("created_utc")),
+        source_type="reddit_comment",
+        query_uid=query_uid,
+        request_url=request_url,
+        raw_payload=payload,
+    )
+
+
 def parse_posts(
     payload: dict[str, Any],
     *,
@@ -761,6 +976,8 @@ def parse_devvit_posts(
     known_tickers: set[str] | None = None,
 ) -> list[RedditPost]:
     items = payload.get("posts")
+    if isinstance(payload.get("post"), dict):
+        items = [payload["post"]]
     if not isinstance(items, list):
         data = payload.get("data") if isinstance(payload.get("data"), dict) else None
         children = data.get("children") if isinstance(data, dict) else None
@@ -784,6 +1001,56 @@ def parse_devvit_posts(
         if post:
             posts.append(post)
     return posts
+
+
+def parse_devvit_comments(
+    payload: dict[str, Any],
+    *,
+    query_uid: str,
+    request_url: str,
+    fallback_subreddit: str | None = None,
+    known_tickers: set[str] | None = None,
+) -> list[RedditComment]:
+    items = payload.get("comments")
+    if isinstance(payload.get("comment"), dict):
+        items = [payload["comment"]]
+    if not isinstance(items, list):
+        items = []
+
+    fallback_post = (
+        normalize_devvit_post_payload(
+            payload["post"],
+            fallback_subreddit=fallback_subreddit,
+        )
+        if isinstance(payload.get("post"), dict)
+        else None
+    )
+    matched_keywords = [
+        str(item).strip()
+        for item in payload.get("matched_keywords", [])
+        if str(item).strip()
+    ] if isinstance(payload.get("matched_keywords"), list) else []
+
+    comments: list[RedditComment] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_devvit_comment_payload(
+            item,
+            fallback_subreddit=fallback_subreddit,
+            fallback_post=fallback_post,
+            matched_keywords=matched_keywords,
+        )
+        comment = parse_comment_payload(
+            normalized,
+            query_uid=query_uid,
+            request_url=request_url,
+            fallback_subreddit=fallback_subreddit,
+            known_tickers=known_tickers,
+        )
+        if comment:
+            comments.append(comment)
+    return comments
 
 
 def fetch_known_tickers(conn: Connection) -> set[str]:
@@ -938,6 +1205,84 @@ def upsert_posts(conn: Connection, posts: list[RedditPost]) -> int:
     return count
 
 
+def upsert_comments(conn: Connection, comments: list[RedditComment]) -> int:
+    count = 0
+    for comment in comments:
+        conn.execute(
+            """
+            INSERT INTO reddit_comments (
+                comment_uid,
+                reddit_id,
+                fullname,
+                post_fullname,
+                parent_fullname,
+                subreddit,
+                body,
+                author_name,
+                permalink_url,
+                score,
+                candidate_tickers,
+                candidate_keywords,
+                matched_keywords,
+                created_utc,
+                source_type,
+                query_uid,
+                request_url,
+                raw_payload,
+                first_seen_at,
+                last_seen_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, now(), now()
+            )
+            ON CONFLICT (comment_uid)
+            DO UPDATE SET
+                reddit_id = EXCLUDED.reddit_id,
+                fullname = EXCLUDED.fullname,
+                post_fullname = EXCLUDED.post_fullname,
+                parent_fullname = EXCLUDED.parent_fullname,
+                subreddit = EXCLUDED.subreddit,
+                body = EXCLUDED.body,
+                author_name = EXCLUDED.author_name,
+                permalink_url = EXCLUDED.permalink_url,
+                score = EXCLUDED.score,
+                candidate_tickers = EXCLUDED.candidate_tickers,
+                candidate_keywords = EXCLUDED.candidate_keywords,
+                matched_keywords = EXCLUDED.matched_keywords,
+                created_utc = EXCLUDED.created_utc,
+                source_type = EXCLUDED.source_type,
+                query_uid = EXCLUDED.query_uid,
+                request_url = EXCLUDED.request_url,
+                raw_payload = EXCLUDED.raw_payload,
+                last_seen_at = now(),
+                updated_at = now()
+            """,
+            (
+                comment.comment_uid,
+                comment.reddit_id,
+                comment.fullname,
+                comment.post_fullname,
+                comment.parent_fullname,
+                comment.subreddit,
+                comment.body,
+                comment.author_name,
+                comment.permalink_url,
+                comment.score,
+                comment.candidate_tickers,
+                comment.candidate_keywords,
+                comment.matched_keywords,
+                comment.created_utc,
+                comment.source_type,
+                comment.query_uid,
+                comment.request_url,
+                Jsonb(comment.raw_payload),
+            ),
+        )
+        count += 1
+    return count
+
+
 def sync_subreddit_posts(
     *,
     subreddit: str,
@@ -1065,6 +1410,79 @@ def ingest_devvit_payload(
         with conn.transaction():
             upsert_post_query(conn, query)
             return upsert_posts(conn, posts)
+
+
+def _extract_devvit_subreddit(payload: dict[str, Any]) -> str:
+    candidates = [
+        payload.get("subreddit"),
+        payload.get("subredditName"),
+    ]
+    for key in ("post", "comment"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("subreddit"), nested.get("subredditName")])
+
+    for candidate in candidates:
+        text = clean_optional_text(candidate)
+        if text:
+            return normalize_subreddit(text)
+    raise RedditError("Devvit match payload 缺少 subreddit。")
+
+
+def ingest_devvit_match_payload(
+    payload: dict[str, Any],
+    *,
+    database_url: str | None = None,
+) -> dict[str, int]:
+    subreddit = _extract_devvit_subreddit(payload)
+    trigger = clean_optional_text(payload.get("trigger")) or "unknown"
+
+    thing_fullname = ""
+    if isinstance(payload.get("comment"), dict):
+        normalized_comment = normalize_devvit_comment_payload(
+            payload["comment"],
+            fallback_subreddit=subreddit,
+            fallback_post=payload.get("post") if isinstance(payload.get("post"), dict) else None,
+        )
+        thing_fullname = clean_optional_text(normalized_comment.get("name")) or ""
+    elif isinstance(payload.get("post"), dict):
+        normalized_post = normalize_devvit_post_payload(
+            payload["post"],
+            fallback_subreddit=subreddit,
+        )
+        thing_fullname = clean_optional_text(normalized_post.get("name")) or ""
+
+    request_url = clean_optional_text(payload.get("request_url")) or build_devvit_trigger_request_url(
+        trigger=trigger,
+        thing_fullname=thing_fullname,
+    )
+    query_uid = build_devvit_trigger_uid(
+        trigger=trigger,
+        thing_fullname=thing_fullname,
+        request_url=request_url,
+    )
+
+    with psycopg.connect(get_database_url(database_url), autocommit=False) as conn:
+        known_tickers = fetch_known_tickers(conn)
+        posts = parse_devvit_posts(
+            payload,
+            query_uid=query_uid,
+            request_url=request_url,
+            fallback_subreddit=subreddit,
+            known_tickers=known_tickers,
+        )
+        comments = parse_devvit_comments(
+            payload,
+            query_uid=query_uid,
+            request_url=request_url,
+            fallback_subreddit=subreddit,
+            known_tickers=known_tickers,
+        )
+        with conn.transaction():
+            return {
+                "posts": upsert_posts(conn, posts),
+                "comments": upsert_comments(conn, comments),
+            }
 
 
 def add_common_sync_args(parser: argparse.ArgumentParser) -> None:

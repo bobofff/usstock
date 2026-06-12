@@ -357,26 +357,36 @@ usstock finnhub sync-company AAPL --from-date 2026-06-01 --to-date 2026-06-09
 
 Reddit API 用于低权重社区讨论信号，默认关注 `r/stocks`、`r/investing`、`r/wallstreetbets`、`r/SecurityAnalysis`。它不作为单独触发候选股的主信号，只在已有 SEC、GDELT 或 Finnhub 证据时提供讨论热度加分。
 
-推荐使用 Devvit bridge，因为它不需要在 old Reddit API 页面创建 app，也不需要维护 `client_id/client_secret`。Devvit 负责读取 Reddit 帖子，然后把 JSON 推送到本项目的 webhook，Python 侧继续写入 `reddit_post_queries` 和 `reddit_posts`。
+推荐使用 Devvit bridge，因为它不需要在 old Reddit API 页面创建 app，也不需要维护 `client_id/client_secret`。当前 Devvit bridge 同时支持两条链路：
 
-先配置 webhook 共享密钥：
+- 定时/菜单同步：每 30 分钟拉取 subreddit listing，把帖子写入 `reddit_post_queries` 和 `reddit_posts`。
+- 实时关键词匹配：通过 `onPostSubmit` 和 `onCommentSubmit` 触发器检查新帖子标题、帖子正文和评论正文，命中关键词后推送到本项目；帖子继续写入 `reddit_posts`，评论写入 `reddit_comments`。
+
+先执行数据库迁移，并配置 webhook 共享密钥：
 
 ```bash
+.venv/bin/python -m usstock.db.migrations migrate
 REDDIT_DEVVIT_WEBHOOK_SECRET=replace-with-a-long-random-secret
 ```
 
-启动管理面板或部署同等 HTTP 服务，并暴露一个 Devvit 可访问的 HTTPS 地址：
+启动管理面板或部署同等 HTTP 服务，并暴露 Devvit 可访问的公开 HTTPS 地址。本地 `127.0.0.1` 只能被你自己的机器访问，Devvit 托管运行时访问不到；开发时可以用 ngrok、Cloudflare Tunnel 或正式部署域名。
 
 ```text
 https://your-domain.example/api/reddit/devvit/posts
+https://your-domain.example/api/reddit/devvit/matches
 ```
 
-Devvit 子项目在 `devvit/reddit-bridge`。使用前需要把 `devvit/reddit-bridge/devvit.json` 里的 HTTP allow-list 域名从 `example.com` 改成你的公开后端 hostname，然后在 Devvit settings 里设置：
+Devvit 子项目在 `devvit/reddit-bridge`。使用前需要把 `devvit/reddit-bridge/devvit.json` 里的 HTTP allow-list 域名 `your-domain.example` 改成你的公开后端 hostname，只写 hostname，不写协议、端口和路径。然后在 Devvit settings 里设置：
 
 ```text
 usstockWebhookUrl=https://your-domain.example/api/reddit/devvit/posts
+usstockMatchWebhookUrl=https://your-domain.example/api/reddit/devvit/matches
 usstockWebhookSecret=<和 REDDIT_DEVVIT_WEBHOOK_SECRET 相同>
+subredditNames=stocks,investing,wallstreetbets,SecurityAnalysis
+keywordPatterns=$NVDA,$MSFT,$AAPL,$TSLA,AI,semiconductor,earnings,guidance,Fed,rates,inflation
 ```
+
+`keywordPatterns` 支持逗号或换行分隔，匹配方式是大小写不敏感的包含匹配。命中后 Devvit 会把 `matched_keywords` 一起推送给后端，方便审计是哪几个词触发了实时入库。
 
 构建和 playtest：
 
@@ -388,7 +398,23 @@ npm run build
 npm run playtest
 ```
 
-Devvit 默认每 30 分钟同步一次，也可以在 subreddit 菜单里手动触发 `Sync usstock Reddit signals`。
+Devvit 默认每 30 分钟同步一次，也可以在 subreddit 菜单里手动触发 `Sync usstock Reddit signals`。实时关键词匹配不需要手动触发，app 安装到 subreddit 后，新帖子或新评论提交时会自动触发：
+
+```json
+{
+  "triggers": {
+    "onPostSubmit": "/internal/triggers/on-post-submit",
+    "onCommentSubmit": "/internal/triggers/on-comment-submit"
+  }
+}
+```
+
+后端接收规则：
+
+- `/api/reddit/devvit/posts`：接收定时/菜单同步的帖子列表。
+- `/api/reddit/devvit/matches`：接收实时关键词命中的单个帖子或评论。
+- 两个 endpoint 都需要 `Authorization: Bearer <REDDIT_DEVVIT_WEBHOOK_SECRET>`。
+- 管理面板的 Reddit 页面会展示社区帖子和实时命中评论。
 
 如果 Devvit 暂时不可用，也可以保留传统 Reddit OAuth 作为备用。传统方式需要在 Reddit 创建 script/web app，并配置 OAuth client credentials 和 User-Agent：
 
@@ -417,7 +443,7 @@ usstock reddit sync-subreddit stocks --listing new --limit 50
 usstock reddit sync-defaults --listing new --limit 50
 ```
 
-原始查询会落到 `reddit_post_queries`，标准化帖子会落到 `reddit_posts`，并抽取候选 ticker 和关键词。Reddit OAuth bearer token 只通过请求头发送，不会写入数据库。
+原始 listing 查询会落到 `reddit_post_queries`，标准化帖子会落到 `reddit_posts`，实时命中评论会落到 `reddit_comments`，并抽取候选 ticker 和关键词。Reddit OAuth bearer token 和 Devvit webhook secret 只通过请求头发送，不会写入数据库。
 
 ### 自动热点发现和每日候选股
 

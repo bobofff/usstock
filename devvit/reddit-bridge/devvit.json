@@ -2,23 +2,33 @@
   "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
   "name": "usstock-bridge",
   "server": {
-    "entry": "dist/index.js"
+    "dir": "dist",
+    "entry": "index.js"
   },
   "permissions": {
     "http": {
       "enable": true,
-      "domains": ["127.0.0.1:7878"]
+      "domains": ["your-domain.example"]
     },
     "reddit": {
       "enable": true
     }
   },
+  "triggers": {
+    "onPostSubmit": "/internal/triggers/on-post-submit",
+    "onCommentSubmit": "/internal/triggers/on-comment-submit"
+  },
   "settings": {
     "global": {
       "usstockWebhookUrl": {
         "type": "string",
-        "label": "usstock webhook URL",
-        "defaultValue": "https://127.0.0.1:7878/api/reddit/devvit/posts"
+        "label": "usstock listing webhook URL",
+        "defaultValue": "https://your-domain.example/api/reddit/devvit/posts"
+      },
+      "usstockMatchWebhookUrl": {
+        "type": "string",
+        "label": "usstock realtime match webhook URL",
+        "defaultValue": "https://your-domain.example/api/reddit/devvit/matches"
       },
       "usstockWebhookSecret": {
         "type": "string",
@@ -61,6 +71,12 @@
         "type": "number",
         "label": "Posts per subreddit",
         "defaultValue": 50
+      },
+      "keywordPatterns": {
+        "type": "paragraph",
+        "label": "Realtime keywords",
+        "helpText": "Comma or newline separated keywords matched against new post titles, post bodies, and comment bodies.",
+        "defaultValue": "$NVDA,$MSFT,$AAPL,$TSLA,AI,semiconductor,earnings,guidance,Fed,rates,inflation"
       }
     }
   },
