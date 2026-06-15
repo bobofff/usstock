@@ -361,6 +361,20 @@ def make_reddit_client() -> RedditClient:
     )
 
 
+def reddit_oauth_missing_settings() -> tuple[str, ...]:
+    settings = get_settings()
+    checks = (
+        ("REDDIT_CLIENT_ID", settings.reddit_client_id),
+        ("REDDIT_CLIENT_SECRET", settings.reddit_client_secret),
+        ("REDDIT_USER_AGENT", settings.reddit_user_agent),
+    )
+    return tuple(name for name, value in checks if not (value or "").strip())
+
+
+def has_reddit_oauth_credentials() -> bool:
+    return not reddit_oauth_missing_settings()
+
+
 def get_database_url(database_url: str | None = None) -> str:
     database_url = database_url or get_settings().database_url
     if not database_url:

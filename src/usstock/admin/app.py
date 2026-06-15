@@ -364,6 +364,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/actions/reddit-defaults":
+                require_reddit_oauth_admin_sync()
                 listing = form_value(form, "listing") or reddit.DEFAULT_LISTING
                 limit = parse_positive_int(form_value(form, "limit")) or 50
                 counts = reddit.sync_default_subreddits(
@@ -381,6 +382,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/actions/reddit-subreddit":
+                require_reddit_oauth_admin_sync()
                 subreddit = form_value(form, "subreddit")
                 if not subreddit:
                     raise AdminPanelError("subreddit 不能为空。")
@@ -475,7 +477,12 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self.redirect("/tasks", "未知操作。", ok=False)
         except Exception as exc:  # pragma: no cover - keeps the panel usable.
             traceback.print_exc()
-            self.redirect("/tasks", f"操作失败：{exc}", ok=False)
+            redirect_path = (
+                "/reddit"
+                if parsed.path.startswith("/actions/reddit-")
+                else "/tasks"
+            )
+            self.redirect(redirect_path, f"操作失败：{exc}", ok=False)
 
     def handle_devvit_reddit_posts(self, raw_body: bytes) -> None:
         try:
@@ -586,6 +593,20 @@ def connect_database(database_url: str | None) -> Connection[dict[str, Any]]:
         get_database_url(database_url),
         autocommit=True,
         row_factory=dict_row,
+    )
+
+
+def require_reddit_oauth_admin_sync() -> None:
+    missing_settings = reddit.reddit_oauth_missing_settings()
+    if not missing_settings:
+        return
+
+    missing = ", ".join(missing_settings)
+    raise AdminPanelError(
+        "旧 Reddit OAuth 备用同步未启用，"
+        f"缺少 {missing}。"
+        "当前 Devvit 主链路不需要 client_id；请在 Devvit app 菜单触发同步，"
+        "或等待 Devvit 定时任务推送到本项目 webhook。"
     )
 
 
@@ -1376,6 +1397,65 @@ def render_finnhub(
     return layout("Finnhub", body, active="/finnhub", query=query)
 
 
+def render_reddit_sync_cards(*, subreddit_value: str = "") -> str:
+    settings = get_settings()
+    missing_oauth_settings = reddit.reddit_oauth_missing_settings()
+    oauth_ready = not missing_oauth_settings
+    oauth_disabled = "" if oauth_ready else " disabled"
+    oauth_hint = (
+        "传统 Reddit OAuth 已配置，可作为 Devvit 备用手动拉取。"
+        if oauth_ready
+        else (
+            f"旧 OAuth 备用未启用，缺少 {', '.join(missing_oauth_settings)}；"
+            "Devvit 同步不需要这些变量。"
+        )
+    )
+    webhook_hint = (
+        "已配置 REDDIT_DEVVIT_WEBHOOK_SECRET。"
+        if settings.reddit_devvit_webhook_secret
+        else "未配置 REDDIT_DEVVIT_WEBHOOK_SECRET，Devvit webhook 会被拒绝。"
+    )
+    listing_options = render_select_options(
+        sorted(reddit.VALID_LISTINGS),
+        reddit.DEFAULT_LISTING,
+    )
+    time_filter_options = render_select_options(
+        sorted(reddit.VALID_TIME_FILTERS),
+        reddit.DEFAULT_TIME_FILTER,
+    )
+    post_limit_input = (
+        '<input name="limit" type="number" min="1" max="100" value="50">'
+    )
+    subreddit_input = (
+        '<input name="subreddit" required placeholder="stocks" '
+        f'value="{e(subreddit_value)}">'
+    )
+    return f"""
+      <article class="task-card">
+        <h2>Devvit 主同步</h2>
+        <p>Devvit scheduler/menu 拉取 Reddit 帖子，并把数据推送到本项目 webhook。</p>
+        <p class="subtle">{e(webhook_hint)}</p>
+        <p><code>/api/reddit/devvit/posts</code><br><code>/api/reddit/devvit/matches</code></p>
+      </article>
+      <form method="post" action="/actions/reddit-defaults">
+        <h2>旧 OAuth 备用：默认社区</h2>
+        <p>{e(oauth_hint)}</p>
+        <label>listing <select name="listing">{listing_options}</select></label>
+        <label>帖子数量 {post_limit_input}</label>
+        <button class="primary" type="submit"{oauth_disabled}>备用同步默认社区</button>
+      </form>
+      <form method="post" action="/actions/reddit-subreddit">
+        <h2>旧 OAuth 备用：单个 subreddit</h2>
+        <p>{e(oauth_hint)}</p>
+        <label>subreddit {subreddit_input}</label>
+        <label>listing <select name="listing">{listing_options}</select></label>
+        <label>time filter <select name="time_filter">{time_filter_options}</select></label>
+        <label>帖子数量 {post_limit_input}</label>
+        <button class="primary" type="submit"{oauth_disabled}>备用同步社区</button>
+      </form>
+    """
+
+
 def render_reddit(
     *,
     database_url: str | None,
@@ -1568,16 +1648,22 @@ def render_reddit(
     except Exception as exc:
         return render_database_error(exc, active="/reddit")
 
+    oauth_ready = reddit.has_reddit_oauth_credentials()
     metrics = [
         metric_box(
-            "Client ID",
-            "已配置" if settings.reddit_client_id else "未配置",
-            "REDDIT_CLIENT_ID",
+            "接入模式",
+            "Devvit",
+            "主同步链路",
         ),
         metric_box(
-            "User-Agent",
-            "已配置" if settings.reddit_user_agent else "未配置",
-            "REDDIT_USER_AGENT",
+            "Webhook 密钥",
+            "已配置" if settings.reddit_devvit_webhook_secret else "未配置",
+            "REDDIT_DEVVIT_WEBHOOK_SECRET",
+        ),
+        metric_box(
+            "旧 API 备用",
+            "可用" if oauth_ready else "未启用",
+            "Reddit OAuth",
         ),
         metric_box("帖子总数", summary.get("total"), "reddit_post"),
         metric_box("近 24 小时", summary.get("recent"), "created_utc"),
@@ -1592,14 +1678,6 @@ def render_reddit(
             f"近 24 小时 {fmt(comment_summary.get('recent'))}",
         ),
     ]
-    listing_options = render_select_options(
-        sorted(reddit.VALID_LISTINGS),
-        reddit.DEFAULT_LISTING,
-    )
-    time_filter_options = render_select_options(
-        sorted(reddit.VALID_TIME_FILTERS),
-        reddit.DEFAULT_TIME_FILTER,
-    )
     body = f"""
     <section class="toolbar">
       <h1>Reddit</h1>
@@ -1612,21 +1690,7 @@ def render_reddit(
     </section>
     <section class="metrics">{"".join(metrics)}</section>
     <section class="task-grid">
-      <form method="post" action="/actions/reddit-defaults">
-        <h2>默认投资社区</h2>
-        <p>同步 stocks、investing、wallstreetbets、SecurityAnalysis，用作低权重社区讨论信号。</p>
-        <label>listing <select name="listing">{listing_options}</select></label>
-        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
-        <button class="primary" type="submit">同步默认社区</button>
-      </form>
-      <form method="post" action="/actions/reddit-subreddit">
-        <h2>单个 subreddit</h2>
-        <label>subreddit <input name="subreddit" required placeholder="stocks" value="{e(subreddit_filter)}"></label>
-        <label>listing <select name="listing">{listing_options}</select></label>
-        <label>time filter <select name="time_filter">{time_filter_options}</select></label>
-        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
-        <button class="primary" type="submit">同步社区</button>
-      </form>
+      {render_reddit_sync_cards(subreddit_value=subreddit_filter)}
     </section>
     <section class="split">
       <div>
@@ -2065,21 +2129,7 @@ def render_tasks(
         <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}"></label>
         <button class="primary" type="submit">同步个股新闻</button>
       </form>
-      <form method="post" action="/actions/reddit-defaults">
-        <h2>Reddit 默认社区</h2>
-        <p>同步投资社区帖子，作为候选股评分中的低权重讨论热度信号。</p>
-        <label>listing <select name="listing">{render_select_options(sorted(reddit.VALID_LISTINGS), reddit.DEFAULT_LISTING)}</select></label>
-        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
-        <button class="primary" type="submit">同步默认社区</button>
-      </form>
-      <form method="post" action="/actions/reddit-subreddit">
-        <h2>Reddit 单个社区</h2>
-        <label>subreddit <input name="subreddit" required placeholder="stocks"></label>
-        <label>listing <select name="listing">{render_select_options(sorted(reddit.VALID_LISTINGS), reddit.DEFAULT_LISTING)}</select></label>
-        <label>time filter <select name="time_filter">{render_select_options(sorted(reddit.VALID_TIME_FILTERS), reddit.DEFAULT_TIME_FILTER)}</select></label>
-        <label>帖子数量 <input name="limit" type="number" min="1" max="100" value="50"></label>
-        <button class="primary" type="submit">同步社区</button>
-      </form>
+      {render_reddit_sync_cards()}
     </section>
     """
     return layout("同步任务", body, active="/tasks", query=query)
@@ -3258,7 +3308,7 @@ def layout(
       gap: 18px;
       align-items: flex-start;
     }}
-    .task-grid form {{
+    .task-grid form, .task-card {{
       display: grid;
       gap: 12px;
       padding: 18px;
@@ -3363,6 +3413,13 @@ def layout(
     button.primary:hover, .button.primary:hover {{
       border-color: var(--primary-hover);
       background: var(--primary-hover);
+    }}
+    button:disabled, button:disabled:hover {{
+      border-color: var(--line-strong);
+      background: #eef1ef;
+      color: var(--muted);
+      cursor: not-allowed;
+      opacity: 0.78;
     }}
     .button.ghost {{
       background: transparent;
@@ -3542,7 +3599,7 @@ def layout(
       .split {{
         grid-template-columns: 1fr;
       }}
-      .split > div, .task-grid form, .status-panel {{
+      .split > div, .task-grid form, .task-card, .status-panel {{
         padding: 14px;
       }}
       .grid-form {{

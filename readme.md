@@ -479,7 +479,7 @@ usstock discover daily --skip-sync --top-n 25
 usstock discover loop --interval-minutes 60
 ```
 
-默认配置会同步 Finnhub `general` 和 `merger` 两个 market news 分类；GDELT 会按主题库逐个同步；Reddit 会同步默认投资社区；SEC 会扫描股票池中排序靠前的活跃标的。可以用 `--max-sec-tickers`、`--reddit-subreddit`、`--reddit-listing`、`--skip-gdelt-sync`、`--skip-finnhub-sync`、`--skip-reddit-sync`、`--skip-sec-sync` 控制同步范围。
+默认配置会同步 Finnhub `general` 和 `merger` 两个 market news 分类；GDELT 会按主题库逐个同步；Reddit 默认读取 Devvit 已入库社区信号，只有配置旧 OAuth 备用凭证时才会主动拉取默认投资社区；SEC 会扫描股票池中排序靠前的活跃标的。可以用 `--max-sec-tickers`、`--reddit-subreddit`、`--reddit-listing`、`--skip-gdelt-sync`、`--skip-finnhub-sync`、`--skip-reddit-sync`、`--skip-sec-sync` 控制同步范围。
 
 ### 本地管理面板
 

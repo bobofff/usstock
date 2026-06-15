@@ -1,6 +1,6 @@
 {
   "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
-  "name": "usstock-bridge",
+  "name": "summer-usstock",
   "server": {
     "dir": "dist",
     "entry": "index.js"
@@ -8,7 +8,9 @@
   "permissions": {
     "http": {
       "enable": true,
-      "domains": ["your-domain.example"]
+      "domains": [
+        "stock.summmmer.asia"
+      ]
     },
     "reddit": {
       "enable": true
@@ -23,12 +25,12 @@
       "usstockWebhookUrl": {
         "type": "string",
         "label": "usstock listing webhook URL",
-        "defaultValue": "https://your-domain.example/api/reddit/devvit/posts"
+        "defaultValue": "https://stock.summmmer.asia/api/reddit/devvit/posts"
       },
       "usstockMatchWebhookUrl": {
         "type": "string",
         "label": "usstock realtime match webhook URL",
-        "defaultValue": "https://your-domain.example/api/reddit/devvit/matches"
+        "defaultValue": "https://stock.summmmer.asia/api/reddit/devvit/matches"
       },
       "usstockWebhookSecret": {
         "type": "string",
@@ -46,11 +48,26 @@
         "type": "select",
         "label": "Listing",
         "options": [
-          {"label": "new", "value": "new"},
-          {"label": "hot", "value": "hot"},
-          {"label": "top", "value": "top"},
-          {"label": "rising", "value": "rising"},
-          {"label": "controversial", "value": "controversial"}
+          {
+            "label": "new",
+            "value": "new"
+          },
+          {
+            "label": "hot",
+            "value": "hot"
+          },
+          {
+            "label": "top",
+            "value": "top"
+          },
+          {
+            "label": "rising",
+            "value": "rising"
+          },
+          {
+            "label": "controversial",
+            "value": "controversial"
+          }
         ],
         "defaultValue": "new"
       },
@@ -58,12 +75,30 @@
         "type": "select",
         "label": "Time filter",
         "options": [
-          {"label": "hour", "value": "hour"},
-          {"label": "day", "value": "day"},
-          {"label": "week", "value": "week"},
-          {"label": "month", "value": "month"},
-          {"label": "year", "value": "year"},
-          {"label": "all", "value": "all"}
+          {
+            "label": "hour",
+            "value": "hour"
+          },
+          {
+            "label": "day",
+            "value": "day"
+          },
+          {
+            "label": "week",
+            "value": "week"
+          },
+          {
+            "label": "month",
+            "value": "month"
+          },
+          {
+            "label": "year",
+            "value": "year"
+          },
+          {
+            "label": "all",
+            "value": "all"
+          }
         ],
         "defaultValue": "day"
       },

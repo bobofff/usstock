@@ -211,6 +211,56 @@ class DiscoveryDailyTest(unittest.TestCase):
         self.assertEqual(scores[0].reddit_post_count, 1)
         self.assertGreater(scores[0].reddit_score, Decimal("0"))
 
+    def test_reddit_sync_skips_legacy_oauth_when_all_settings_missing(self) -> None:
+        warnings: list[str] = []
+
+        with (
+            patch.object(
+                daily.reddit,
+                "reddit_oauth_missing_settings",
+                return_value=(
+                    "REDDIT_CLIENT_ID",
+                    "REDDIT_CLIENT_SECRET",
+                    "REDDIT_USER_AGENT",
+                ),
+            ),
+            patch.object(daily.reddit, "make_reddit_client") as make_client,
+        ):
+            counts = daily.maybe_sync_reddit_subreddits(
+                database_url="postgresql://example/discovery",
+                subreddits=("stocks",),
+                listing="new",
+                limit=50,
+                warnings=warnings,
+            )
+
+        self.assertEqual(counts, {})
+        self.assertEqual(warnings, [])
+        make_client.assert_not_called()
+
+    def test_reddit_sync_warns_when_legacy_oauth_is_partially_configured(self) -> None:
+        warnings: list[str] = []
+
+        with (
+            patch.object(
+                daily.reddit,
+                "reddit_oauth_missing_settings",
+                return_value=("REDDIT_USER_AGENT",),
+            ),
+            patch.object(daily.reddit, "make_reddit_client") as make_client,
+        ):
+            counts = daily.maybe_sync_reddit_subreddits(
+                database_url="postgresql://example/discovery",
+                subreddits=("stocks",),
+                listing="new",
+                limit=50,
+                warnings=warnings,
+            )
+
+        self.assertEqual(counts, {})
+        self.assertEqual(warnings, ["Reddit OAuth 未同步: 缺少 REDDIT_USER_AGENT"])
+        make_client.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -809,6 +809,14 @@ def maybe_sync_reddit_subreddits(
     warnings: list[str],
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
+    missing_oauth_settings = reddit.reddit_oauth_missing_settings()
+    if len(missing_oauth_settings) == 3:
+        return counts
+    if missing_oauth_settings:
+        missing = ", ".join(missing_oauth_settings)
+        warnings.append(f"Reddit OAuth 未同步: 缺少 {missing}")
+        return counts
+
     try:
         client = reddit.make_reddit_client()
     except Exception as exc:
