@@ -2061,78 +2061,184 @@ def render_tasks(
     )
     body = f"""
     <section class="toolbar">
-      <h1>同步任务</h1>
+      <div>
+        <h1>同步任务</h1>
+        <p class="page-kicker">主流程放前面，手动补数和排查工具放后面。</p>
+      </div>
     </section>
     {discovery_status}
-    <section class="task-grid">
-      <form method="post" action="/actions/discovery-daily">
-        <h2>自动热点发现</h2>
-        <p>按主题库同步 GDELT，拉取 Finnhub 市场新闻，读取 Reddit 社区信号，扫描 SEC filings，并生成每日候选股评分。</p>
-        <label>候选数量 <input name="top_n" type="number" min="1" value="{discovery.DEFAULT_TOP_N}"></label>
-        <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{discovery.DEFAULT_LOOKBACK_HOURS}"></label>
-        <label>GDELT 文章数 <input name="gdelt_max_records" type="number" min="1" max="250" value="{gdelt.DEFAULT_MAX_RECORDS}"></label>
-        <label>SEC 扫描标的数 <input name="max_sec_tickers" type="number" min="1" value="{discovery.DEFAULT_MAX_SEC_TICKERS}"></label>
-        <label>SEC filing 数量 <input name="sec_filing_limit" type="number" min="1" value="{discovery.DEFAULT_SEC_FILING_LIMIT}"></label>
-        <label>定时间隔分钟 <input name="interval_minutes" type="number" min="1" value="60"></label>
-        <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
-        <label><input type="checkbox" name="skip_finnhub_sync" value="1"> 跳过 Finnhub</label>
-        <label><input type="checkbox" name="skip_gdelt_sync" value="1"> 跳过 GDELT</label>
-        <label><input type="checkbox" name="skip_reddit_sync" value="1"> 跳过 Reddit</label>
-        <label><input type="checkbox" name="skip_sec_sync" value="1"> 跳过 SEC</label>
-        <div class="button-row">
-          <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
-          <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
-          <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
-        </div>
-      </form>
-      <form method="post" action="/actions/topic-extract">
-        <h2>新闻候选主题</h2>
-        <p>从已入库的 Finnhub 和 GDELT 新闻中抽取候选主题，先进入候选表等待审核。</p>
-        <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{topic_candidates.DEFAULT_TOPIC_EXTRACTION_LOOKBACK_HOURS}"></label>
-        <label>候选数量 <input name="max_candidates" type="number" min="1" value="{topic_candidates.DEFAULT_MAX_CANDIDATES}"></label>
-        <label>最少文章数 <input name="min_articles" type="number" min="1" value="{topic_candidates.DEFAULT_MIN_ARTICLES}"></label>
-        <label>最低分数 <input name="min_score" type="number" min="0" step="0.1" value="{topic_candidates.DEFAULT_MIN_SCORE}"></label>
-        <label><input type="checkbox" name="include_existing_matches" value="1"> 保留已匹配正式主题的候选</label>
-        <button class="primary" type="submit">抽取候选主题</button>
-      </form>
-      <form method="post" action="/actions/sec-registry">
-        <h2>SEC 公司映射</h2>
-        <p>刷新 SEC ticker / CIK 映射，并回填股票池里的 CIK。</p>
-        <button class="primary" type="submit">同步映射</button>
-      </form>
-      <form method="post" action="/actions/sec-ticker">
-        <h2>SEC 单只标的</h2>
-        <label>ticker <input name="ticker" required placeholder="AAPL"></label>
-        <label>filing 数量 <input name="filing_limit" type="number" min="1" placeholder="20"></label>
-        <label>fact 数量 <input name="fact_limit" type="number" min="1" placeholder="500"></label>
-        <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
-        <button class="primary" type="submit">同步标的</button>
-      </form>
-      <form method="post" action="/actions/gdelt-query">
-        <h2>GDELT 查询</h2>
-        <label>query <input name="query" required placeholder="&quot;artificial intelligence&quot; semiconductor"></label>
-        <label>timespan <input name="timespan" placeholder="24h" value="24h"></label>
-        <label>文章数量 <input name="max_records" type="number" min="1" max="250" value="75"></label>
-        <button class="primary" type="submit">同步新闻</button>
-      </form>
-      <form method="post" action="/actions/finnhub-market">
-        <h2>Finnhub 市场新闻</h2>
-        <p>同步 market news，用作金融新闻主源。</p>
-        <label>category <input name="category" placeholder="general" value="{e(finnhub.DEFAULT_MARKET_CATEGORY)}"></label>
-        <label>minId <input name="min_id" type="number" min="1" placeholder="增量 ID，可空"></label>
-        <button class="primary" type="submit">同步市场新闻</button>
-      </form>
-      <form method="post" action="/actions/finnhub-company">
-        <h2>Finnhub 个股新闻</h2>
-        <label>ticker <input name="ticker" required placeholder="AAPL"></label>
-        <label>开始日期 <input name="from_date" type="date" value="{week_ago.isoformat()}"></label>
-        <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}"></label>
-        <button class="primary" type="submit">同步个股新闻</button>
-      </form>
-      {render_reddit_sync_cards()}
-    </section>
+    {render_discovery_task_panel()}
+    {render_manual_sync_tools(today=today, week_ago=week_ago)}
+    {render_topic_extraction_task()}
+    {render_reddit_sync_hold_card()}
     """
     return layout("同步任务", body, active="/tasks", query=query)
+
+
+def render_discovery_task_panel() -> str:
+    return f"""
+    <section>
+      <form class="discovery-panel" method="post" action="/actions/discovery-daily">
+        <input type="hidden" name="skip_reddit_sync" value="1">
+        <div class="task-panel-header">
+          <div>
+            <span class="eyebrow">主流程</span>
+            <h2>自动热点发现</h2>
+            <p>同步 Finnhub、GDELT 和 SEC，刷新主题命中与每日候选评分。Reddit 主动拉取暂缓，本页只读取库内已有 Reddit 数据。</p>
+          </div>
+          <div class="button-row action-row">
+            <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
+            <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
+            <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
+          </div>
+        </div>
+        <div class="form-sections">
+          <div class="form-section">
+            <h3>发现参数</h3>
+            <div class="field-grid">
+              <label>候选数量 <input name="top_n" type="number" min="1" value="{discovery.DEFAULT_TOP_N}"></label>
+              <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{discovery.DEFAULT_LOOKBACK_HOURS}"></label>
+              <label>GDELT 文章数 <input name="gdelt_max_records" type="number" min="1" max="250" value="{gdelt.DEFAULT_MAX_RECORDS}"></label>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>SEC 扫描</h3>
+            <div class="field-grid">
+              <label>扫描标的数 <input name="max_sec_tickers" type="number" min="1" value="{discovery.DEFAULT_MAX_SEC_TICKERS}"></label>
+              <label>filing 数量 <input name="sec_filing_limit" type="number" min="1" value="{discovery.DEFAULT_SEC_FILING_LIMIT}"></label>
+              <label>定时间隔分钟 <input name="interval_minutes" type="number" min="1" value="60"></label>
+            </div>
+            <div class="checkbox-stack">
+              <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>数据源策略</h3>
+            <div class="checkbox-stack">
+              <label><input type="checkbox" name="skip_finnhub_sync" value="1"> 跳过 Finnhub 新闻</label>
+              <label><input type="checkbox" name="skip_gdelt_sync" value="1"> 跳过 GDELT 主题新闻</label>
+              <label><input type="checkbox" name="skip_sec_sync" value="1"> 跳过 SEC filings</label>
+            </div>
+            <p class="inline-note">Reddit 主动拉取已暂停，避免当前接入问题影响主流程。</p>
+          </div>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def render_manual_sync_tools(*, today: date, week_ago: date) -> str:
+    return f"""
+    <section class="task-section">
+      <div class="task-section-header">
+        <div>
+          <h2>手动补数工具</h2>
+          <p>用于排查单个数据源或补齐局部数据，日常优先使用上面的自动热点发现。</p>
+        </div>
+      </div>
+      <div class="task-grid">
+        <form method="post" action="/actions/sec-registry">
+          <h2>SEC 公司映射</h2>
+          <p>刷新 SEC ticker / CIK 映射，并回填股票池里的 CIK。</p>
+          <button class="primary" type="submit">同步映射</button>
+        </form>
+        <form method="post" action="/actions/sec-ticker">
+          <h2>SEC 单只标的</h2>
+          <label>ticker <input name="ticker" required placeholder="AAPL"></label>
+          <label>filing 数量 <input name="filing_limit" type="number" min="1" placeholder="20"></label>
+          <label>fact 数量 <input name="fact_limit" type="number" min="1" placeholder="500"></label>
+          <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
+          <button class="primary" type="submit">同步标的</button>
+        </form>
+        <form method="post" action="/actions/gdelt-query">
+          <h2>GDELT 查询</h2>
+          <label>query <input name="query" required placeholder="&quot;artificial intelligence&quot; semiconductor"></label>
+          <label>timespan <input name="timespan" placeholder="24h" value="24h"></label>
+          <label>文章数量 <input name="max_records" type="number" min="1" max="250" value="75"></label>
+          <button class="primary" type="submit">同步新闻</button>
+        </form>
+        <form method="post" action="/actions/finnhub-market">
+          <h2>Finnhub 市场新闻</h2>
+          <p>同步 market news，用作金融新闻主源。</p>
+          <label>category <input name="category" placeholder="general" value="{e(finnhub.DEFAULT_MARKET_CATEGORY)}"></label>
+          <label>minId <input name="min_id" type="number" min="1" placeholder="增量 ID，可空"></label>
+          <button class="primary" type="submit">同步市场新闻</button>
+        </form>
+        <form method="post" action="/actions/finnhub-company">
+          <h2>Finnhub 个股新闻</h2>
+          <label>ticker <input name="ticker" required placeholder="AAPL"></label>
+          <label>开始日期 <input name="from_date" type="date" value="{week_ago.isoformat()}"></label>
+          <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}"></label>
+          <button class="primary" type="submit">同步个股新闻</button>
+        </form>
+      </div>
+    </section>
+    """
+
+
+def render_topic_extraction_task() -> str:
+    return f"""
+    <section class="task-section">
+      <div class="task-section-header">
+        <div>
+          <h2>主题后处理</h2>
+          <p>从已入库新闻里抽取候选主题，结果进入候选表等待审核。</p>
+        </div>
+        <a class="button ghost" href="/topics">查看主题</a>
+      </div>
+      <div class="task-grid narrow-grid">
+        <form method="post" action="/actions/topic-extract">
+          <h2>新闻候选主题</h2>
+          <label>回看小时 <input name="lookback_hours" type="number" min="1" value="{topic_candidates.DEFAULT_TOPIC_EXTRACTION_LOOKBACK_HOURS}"></label>
+          <label>候选数量 <input name="max_candidates" type="number" min="1" value="{topic_candidates.DEFAULT_MAX_CANDIDATES}"></label>
+          <label>最少文章数 <input name="min_articles" type="number" min="1" value="{topic_candidates.DEFAULT_MIN_ARTICLES}"></label>
+          <label>最低分数 <input name="min_score" type="number" min="0" step="0.1" value="{topic_candidates.DEFAULT_MIN_SCORE}"></label>
+          <label><input type="checkbox" name="include_existing_matches" value="1"> 保留已匹配正式主题的候选</label>
+          <button class="primary" type="submit">抽取候选主题</button>
+        </form>
+      </div>
+    </section>
+    """
+
+
+def render_reddit_sync_hold_card() -> str:
+    settings = get_settings()
+    webhook_state = (
+        "Webhook 密钥已配置"
+        if settings.reddit_devvit_webhook_secret
+        else "Webhook 密钥未配置"
+    )
+    oauth_state = (
+        "旧 OAuth 备用可用"
+        if reddit.has_reddit_oauth_credentials()
+        else "旧 OAuth 备用未启用"
+    )
+    return f"""
+    <section class="task-section">
+      <div class="task-section-header">
+        <div>
+          <h2>Reddit 接入</h2>
+          <p>当前对接暂缓处理，已从本页主动同步任务里拿掉。</p>
+        </div>
+        <span class="badge muted">暂缓</span>
+      </div>
+      <article class="task-card muted-card">
+        <div class="task-card-row">
+          <div>
+            <h2>社区信号排查入口</h2>
+            <p>自动热点发现不会在本页触发 Reddit 备用拉取；需要查看帖子、webhook 或备用同步状态时再进入 Reddit 页面。</p>
+          </div>
+          <div class="button-row">
+            <a class="button" href="/reddit">打开 Reddit 页面</a>
+          </div>
+        </div>
+        <div class="status-line">
+          <span>{e(webhook_state)}</span>
+          <span>{e(oauth_state)}</span>
+        </div>
+      </article>
+    </section>
+    """
 
 
 def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
@@ -3241,10 +3347,20 @@ def layout(
       margin-bottom: 12px;
       font-size: 16px;
     }}
+    h3 {{
+      margin: 0;
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.3;
+    }}
     p {{
       margin: 0 0 14px;
       color: var(--muted);
       line-height: 1.55;
+    }}
+    .page-kicker {{
+      margin: 5px 0 0;
+      font-size: 13px;
     }}
     .toolbar, section.toolbar {{
       display: flex;
@@ -3308,6 +3424,9 @@ def layout(
       gap: 18px;
       align-items: flex-start;
     }}
+    .narrow-grid {{
+      grid-template-columns: repeat(auto-fit, minmax(320px, 520px));
+    }}
     .task-grid form, .task-card {{
       display: grid;
       gap: 12px;
@@ -3317,10 +3436,106 @@ def layout(
       background: var(--surface);
       box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
     }}
+    .task-section-header {{
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }}
+    .task-section-header p {{
+      margin: 4px 0 0;
+      max-width: 760px;
+    }}
+    .discovery-panel {{
+      display: grid;
+      gap: 18px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
+    }}
+    .task-panel-header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .task-panel-header p {{
+      max-width: 740px;
+      margin-bottom: 0;
+    }}
+    .eyebrow {{
+      display: inline-block;
+      margin-bottom: 7px;
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 760;
+    }}
+    .form-sections {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }}
+    .form-section {{
+      display: grid;
+      align-content: start;
+      gap: 12px;
+      min-width: 0;
+    }}
+    .field-grid, .checkbox-stack {{
+      display: grid;
+      gap: 12px;
+    }}
+    .inline-note {{
+      margin: 0;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+      font-size: 13px;
+    }}
+    .muted-card {{
+      background: var(--surface-soft);
+    }}
+    .task-card-row {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .task-card-row p {{
+      margin-bottom: 0;
+      max-width: 760px;
+    }}
+    .status-line {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .status-line span {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 12px;
+      font-weight: 650;
+    }}
     .button-row {{
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
+    }}
+    .action-row {{
+      justify-content: flex-end;
+      min-width: 286px;
     }}
     .filters {{
       display: flex;
@@ -3596,10 +3811,25 @@ def layout(
       h1 {{
         font-size: 21px;
       }}
+      .task-panel-header, .task-section-header, .task-card-row {{
+        align-items: flex-start;
+        flex-direction: column;
+      }}
+      .action-row {{
+        width: 100%;
+        min-width: 0;
+        justify-content: flex-start;
+      }}
+      .action-row button {{
+        flex: 1 1 128px;
+      }}
+      .form-sections {{
+        grid-template-columns: 1fr;
+      }}
       .split {{
         grid-template-columns: 1fr;
       }}
-      .split > div, .task-grid form, .task-card, .status-panel {{
+      .split > div, .task-grid form, .task-card, .status-panel, .discovery-panel {{
         padding: 14px;
       }}
       .grid-form {{
