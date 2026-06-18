@@ -3,15 +3,73 @@
 from __future__ import annotations
 
 import re
+import html
+import urllib.parse
 from collections import Counter
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9&+\-]*")
 SLUG_RE = re.compile(r"[^a-z0-9]+")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WHITESPACE_RE = re.compile(r"\s+")
+TICKER_CASH_RE = re.compile(r"(?<![A-Za-z0-9])\$([A-Z][A-Z0-9.\-]{0,5})(?![A-Za-z0-9])")
+TICKER_EXCHANGE_RE = re.compile(
+    r"\b(?:NASDAQ|NYSE|AMEX|NYSEARCA|OTC):\s*([A-Z][A-Z0-9.\-]{0,5})\b"
+)
+TICKER_WORD_RE = re.compile(r"\b[A-Z][A-Z0-9.\-]{1,5}\b")
+
+TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "utm_campaign",
+    "utm_content",
+    "utm_medium",
+    "utm_source",
+    "utm_term",
+}
+
+PROMOTIONAL_LINE_TERMS = {
+    "advertisement",
+    "all rights reserved",
+    "click here",
+    "cookie policy",
+    "newsletter",
+    "privacy policy",
+    "read more",
+    "sign up",
+    "sponsored content",
+    "subscribe",
+}
+
+LOW_QUALITY_TITLE_PREFIXES = (
+    "advertisement",
+    "sponsored",
+    "subscribe",
+    "sign up",
+)
+
+COMMON_TICKER_FALSE_POSITIVES = {
+    "CEO",
+    "CFO",
+    "COO",
+    "CPI",
+    "EPS",
+    "ETF",
+    "FDA",
+    "FOMC",
+    "GDP",
+    "IPO",
+    "M&A",
+    "SEC",
+    "USA",
+    "USD",
+}
 
 SIGNAL_SHORT_WORDS = {
     "ai",
@@ -34,6 +92,10 @@ ACRONYMS = {
 STOPWORDS = {
     "about",
     "above",
+    "acquire",
+    "acquired",
+    "acquires",
+    "acquiring",
     "after",
     "again",
     "against",
@@ -48,6 +110,7 @@ STOPWORDS = {
     "as",
     "at",
     "be",
+    "been",
     "before",
     "being",
     "between",
@@ -67,11 +130,18 @@ STOPWORDS = {
     "days",
     "down",
     "during",
+    "filed",
+    "files",
+    "filing",
+    "filings",
     "for",
+    "form",
+    "forms",
     "from",
     "group",
     "has",
     "have",
+    "how",
     "his",
     "holdings",
     "inc",
@@ -105,10 +175,17 @@ STOPWORDS = {
     "this",
     "through",
     "to",
+    "talk",
+    "talks",
     "under",
     "up",
     "us",
     "was",
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
     "with",
     "would",
 }
@@ -159,16 +236,155 @@ class _TopicBucket:
     source_types: Counter[str] = field(default_factory=Counter)
     tickers: Counter[str] = field(default_factory=Counter)
     keyword_scores: Counter[str] = field(default_factory=Counter)
+    current_keyword_scores: Counter[str] = field(default_factory=Counter)
+    previous_keyword_scores: Counter[str] = field(default_factory=Counter)
     score: Decimal = Decimal("0")
 
     def merge(self, other: "_TopicBucket") -> None:
+        """把相似短语桶合并为同一个候选主题。"""
+
         self.phrase_scores.update(other.phrase_scores)
         self.evidence_by_uid.update(other.evidence_by_uid)
         self.source_names.update(other.source_names)
         self.source_types.update(other.source_types)
         self.tickers.update(other.tickers)
         self.keyword_scores.update(other.keyword_scores)
+        self.current_keyword_scores.update(other.current_keyword_scores)
+        self.previous_keyword_scores.update(other.previous_keyword_scores)
         self.score += other.score
+
+
+def clean_text(value: object) -> str:
+    """清洗标题或摘要文本，去掉 HTML、广告行和多余空白。"""
+
+    text = html.unescape(str(value or ""))
+    text = HTML_TAG_RE.sub(" ", text)
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = WHITESPACE_RE.sub(" ", raw_line).strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if any(term in lower for term in PROMOTIONAL_LINE_TERMS):
+            continue
+        lines.append(line)
+    return WHITESPACE_RE.sub(" ", " ".join(lines)).strip()
+
+
+def canonicalize_url(value: str | None) -> str | None:
+    """规范化 URL，用于跨来源去重。"""
+
+    if not value:
+        return None
+    parsed = urllib.parse.urlsplit(value.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return value.strip()
+
+    query_items = [
+        (key, val)
+        for key, val in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in TRACKING_QUERY_PARAMS
+    ]
+    query = urllib.parse.urlencode(sorted(query_items), doseq=True)
+    path = parsed.path.rstrip("/") or "/"
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            query,
+            "",
+        )
+    )
+
+
+def extract_ticker_mentions(
+    text: str,
+    *,
+    known_tickers: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """从文本中抽取显式 ticker，并用股票池过滤普通大写词误判。"""
+
+    known = {
+        ticker
+        for ticker in (_normalize_ticker_symbol(item, allow_ambiguous=True) for item in known_tickers)
+        if ticker
+    }
+    tickers: list[str] = []
+
+    for pattern in (TICKER_CASH_RE, TICKER_EXCHANGE_RE):
+        for match in pattern.finditer(text):
+            ticker = _normalize_ticker_symbol(match.group(1), allow_ambiguous=True)
+            if ticker and ticker not in tickers:
+                tickers.append(ticker)
+
+    if known:
+        for match in TICKER_WORD_RE.finditer(text):
+            ticker = _normalize_ticker_symbol(match.group(0), allow_ambiguous=True)
+            if ticker in known and ticker not in tickers:
+                tickers.append(ticker)
+
+    return tuple(tickers)
+
+
+def prepare_news_documents(
+    documents: Iterable[NewsDocument],
+    *,
+    known_tickers: Iterable[str] = (),
+) -> list[NewsDocument]:
+    """统一清洗、过滤和去重新闻文档，产出主题抽取可直接使用的输入。"""
+
+    prepared: list[NewsDocument] = []
+    seen_uids: set[str] = set()
+    seen_urls: set[str] = set()
+    seen_title_keys: set[str] = set()
+    seen_title_terms: list[set[str]] = []
+
+    for document in documents:
+        title = clean_text(document.title)
+        body = clean_text(document.body)
+        if _is_low_quality_document(title, body):
+            continue
+
+        canonical_url = canonicalize_url(document.url)
+        title_key = _dedupe_title_key(title)
+        title_terms = set(tokenize_terms(title))
+        source_uid = str(document.source_uid or canonical_url or title_key).strip()
+        if not source_uid:
+            continue
+
+        if source_uid in seen_uids:
+            continue
+        if canonical_url and canonical_url in seen_urls:
+            continue
+        if title_key and title_key in seen_title_keys:
+            continue
+        if _is_near_duplicate_title(title_terms, seen_title_terms):
+            continue
+
+        tickers = _merge_tickers(
+            document.tickers,
+            extract_ticker_mentions(f"{title} {body}", known_tickers=known_tickers),
+        )
+        prepared.append(
+            replace(
+                document,
+                source_uid=source_uid,
+                title=title,
+                body=body,
+                url=canonical_url or document.url,
+                tickers=tickers,
+            )
+        )
+        seen_uids.add(source_uid)
+        if canonical_url:
+            seen_urls.add(canonical_url)
+        if title_key:
+            seen_title_keys.add(title_key)
+        if title_terms:
+            seen_title_terms.append(title_terms)
+
+    return prepared
 
 
 def extract_news_topics(
@@ -180,8 +396,22 @@ def extract_news_topics(
     min_score: Decimal | int | str = Decimal("8"),
     include_existing_matches: bool = False,
     evidence_limit: int = 5,
+    known_tickers: Iterable[str] = (),
+    growth_window_hours: int = 24,
 ) -> list[ExtractedTopicCandidate]:
-    buckets = _merge_similar_buckets(_collect_buckets(documents))
+    """从新闻文档中抽取候选主题，并写入清洗、去重和增长率元数据。"""
+
+    prepared_documents = prepare_news_documents(
+        documents,
+        known_tickers=known_tickers,
+    )
+    current_cutoff = _current_window_cutoff(
+        prepared_documents,
+        growth_window_hours=growth_window_hours,
+    )
+    buckets = _merge_similar_buckets(
+        _collect_buckets(prepared_documents, current_cutoff=current_cutoff)
+    )
     existing = list(existing_topics)
     min_score_decimal = Decimal(str(min_score))
     candidates: list[ExtractedTopicCandidate] = []
@@ -197,11 +427,13 @@ def extract_news_topics(
 
         source_count = len(bucket.source_names)
         ticker_count = len(bucket.tickers)
+        growth_bonus = _bucket_growth_bonus(bucket)
         trend_score = (
             bucket.score
             + Decimal(article_count * 4)
             + Decimal(source_count * 2)
             + Decimal(ticker_count)
+            + growth_bonus
         ).quantize(Decimal("0.0001"))
         if trend_score < min_score_decimal:
             continue
@@ -237,6 +469,10 @@ def extract_news_topics(
                     "primary_phrase": bucket.phrase,
                     "similarity_to_existing": str(similarity),
                     "phrase_scores": dict(bucket.phrase_scores.most_common(8)),
+                    "keyword_frequency": dict(bucket.keyword_scores.most_common(10)),
+                    "keyword_growth": _keyword_growth(bucket, keywords),
+                    "growth_bonus": str(growth_bonus),
+                    "current_window_start": _format_time(current_cutoff),
                 },
             )
         )
@@ -256,6 +492,8 @@ def extract_news_topics(
 def build_existing_topic_signatures(
     topics: Iterable[dict[str, Any]],
 ) -> list[ExistingTopicSignature]:
+    """把正式主题转换成可用于相似度匹配的签名。"""
+
     signatures: list[ExistingTopicSignature] = []
     for topic in topics:
         terms: set[str] = set()
@@ -283,6 +521,8 @@ def build_existing_topic_signatures(
 
 
 def tokenize_terms(text: str) -> list[str]:
+    """把文本拆成可参与主题抽取的英文词项。"""
+
     terms: list[str] = []
     for raw_word in WORD_RE.findall(text.lower()):
         word = raw_word.strip("-+")
@@ -297,6 +537,8 @@ def tokenize_terms(text: str) -> list[str]:
 
 
 def topic_name_from_phrase(phrase: str) -> str:
+    """把核心短语转换成面向展示的主题名称。"""
+
     words = []
     for word in phrase.split():
         words.append(ACRONYMS.get(word, word.capitalize()))
@@ -304,11 +546,15 @@ def topic_name_from_phrase(phrase: str) -> str:
 
 
 def slugify_topic(topic_name: str) -> str:
+    """把主题名称规范化为可入库的 slug。"""
+
     slug = SLUG_RE.sub("_", topic_name.lower()).strip("_")
     return (slug or "topic")[:80]
 
 
 def build_gdelt_query(keywords: Iterable[str], *, limit: int = 8) -> str:
+    """根据关键词生成可直接用于 GDELT DOC API 的查询表达式。"""
+
     parts: list[str] = []
     for keyword in keywords:
         item = keyword.strip().lower()
@@ -323,21 +569,35 @@ def build_gdelt_query(keywords: Iterable[str], *, limit: int = 8) -> str:
     return " OR ".join(parts) or "market"
 
 
-def _collect_buckets(documents: Iterable[NewsDocument]) -> list[_TopicBucket]:
+def _collect_buckets(
+    documents: Iterable[NewsDocument],
+    *,
+    current_cutoff: datetime | None,
+) -> list[_TopicBucket]:
+    """把文档短语聚合为候选主题桶。"""
+
     buckets: dict[str, _TopicBucket] = {}
     for document in documents:
         phrases = _document_phrases(document)
         if not phrases:
             continue
+        is_current = _is_current_document(document, current_cutoff)
 
         for phrase, phrase_score in phrases.items():
             bucket = buckets.setdefault(phrase, _TopicBucket(phrase=phrase))
             bucket.score += Decimal(str(phrase_score))
             bucket.phrase_scores[phrase] += int(phrase_score * 10)
             bucket.keyword_scores[phrase] += int(phrase_score * 10)
+            window_scores = (
+                bucket.current_keyword_scores
+                if is_current
+                else bucket.previous_keyword_scores
+            )
+            window_scores[phrase] += 1
 
             for token in phrase.split():
                 bucket.keyword_scores[token] += 1
+                window_scores[token] += 1
 
             source_name = document.source_name or document.source_type or "unknown"
             bucket.source_names[source_name] += 1
@@ -364,7 +624,162 @@ def _collect_buckets(documents: Iterable[NewsDocument]) -> list[_TopicBucket]:
     return list(buckets.values())
 
 
+def _normalize_ticker_symbol(
+    value: object,
+    *,
+    allow_ambiguous: bool = False,
+) -> str | None:
+    """规范化 ticker 文本，并过滤常见大写缩写误判。"""
+
+    ticker = str(value or "").strip().upper().replace(".", "-")
+    ticker = ticker.strip("$")
+    if not re.fullmatch(r"[A-Z][A-Z0-9\-]{0,5}", ticker):
+        return None
+    if not allow_ambiguous and ticker in COMMON_TICKER_FALSE_POSITIVES:
+        return None
+    return ticker
+
+
+def _merge_tickers(
+    provided: Iterable[str],
+    extracted: Iterable[str],
+) -> tuple[str, ...]:
+    """合并数据源 ticker 和文本中抽取的 ticker，保持稳定顺序。"""
+
+    tickers: list[str] = []
+    for value in (*tuple(provided), *tuple(extracted)):
+        ticker = _normalize_ticker_symbol(value)
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+    return tuple(tickers)
+
+
+def _is_low_quality_document(title: str, body: str) -> bool:
+    """判断文档是否过短、广告化或没有足够主题信息。"""
+
+    lower_title = title.lower()
+    if not title:
+        return True
+    if any(lower_title.startswith(prefix) for prefix in LOW_QUALITY_TITLE_PREFIXES):
+        return True
+    if len(tokenize_terms(f"{title} {body}")) < 2:
+        return True
+    return False
+
+
+def _dedupe_title_key(title: str) -> str:
+    """生成用于精确去重的标题规范化键。"""
+
+    terms = tokenize_terms(title)
+    return " ".join(terms)
+
+
+def _is_near_duplicate_title(
+    title_terms: set[str],
+    seen_title_terms: list[set[str]],
+) -> bool:
+    """用 Jaccard 相似度识别标题近似重复。"""
+
+    if len(title_terms) < 3:
+        return False
+    for seen in seen_title_terms:
+        if not seen:
+            continue
+        overlap = len(title_terms & seen)
+        union = len(title_terms | seen)
+        if union and Decimal(overlap) / Decimal(union) >= Decimal("0.92"):
+            return True
+    return False
+
+
+def _current_window_cutoff(
+    documents: list[NewsDocument],
+    *,
+    growth_window_hours: int,
+) -> datetime | None:
+    """根据文档最新时间计算当前增长窗口起点。"""
+
+    latest = max(
+        (
+            value
+            for value in (_as_datetime(document.published_at) for document in documents)
+            if value is not None
+        ),
+        default=None,
+    )
+    if latest is None:
+        return None
+    return latest - timedelta(hours=max(1, growth_window_hours))
+
+
+def _is_current_document(
+    document: NewsDocument,
+    current_cutoff: datetime | None,
+) -> bool:
+    """判断文档是否落在当前增长窗口内。"""
+
+    if current_cutoff is None:
+        return True
+    published_at = _as_datetime(document.published_at)
+    if published_at is None:
+        return True
+    return published_at >= current_cutoff
+
+
+def _as_datetime(value: datetime | date | None) -> datetime | None:
+    """把 date/datetime 统一转换为 UTC datetime，便于窗口比较。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.combine(value, time.min, tzinfo=timezone.utc)
+
+
+def _bucket_growth_bonus(bucket: _TopicBucket) -> Decimal:
+    """根据当前窗口相对上一窗口的关键词增长给主题少量加分。"""
+
+    current = sum(bucket.current_keyword_scores.values())
+    previous = sum(bucket.previous_keyword_scores.values())
+    if current <= 0:
+        return Decimal("0")
+    if previous <= 0:
+        return min(Decimal(current) / Decimal("2"), Decimal("6"))
+    growth = (Decimal(current) - Decimal(previous)) / Decimal(previous)
+    return min(max(growth, Decimal("0")) * Decimal("4"), Decimal("6"))
+
+
+def _keyword_growth(
+    bucket: _TopicBucket,
+    keywords: Iterable[str],
+) -> dict[str, dict[str, str | int | None]]:
+    """输出关键词在当前窗口和上一窗口中的频次及变化率。"""
+
+    result: dict[str, dict[str, str | int | None]] = {}
+    for keyword in keywords:
+        current = bucket.current_keyword_scores.get(keyword, 0)
+        previous = bucket.previous_keyword_scores.get(keyword, 0)
+        if previous:
+            growth_rate = str(
+                ((Decimal(current) - Decimal(previous)) / Decimal(previous)).quantize(
+                    Decimal("0.0001")
+                )
+            )
+        else:
+            growth_rate = None
+        result[keyword] = {
+            "current": current,
+            "previous": previous,
+            "growth_rate": growth_rate,
+        }
+    return result
+
+
 def _document_phrases(document: NewsDocument) -> Counter[str]:
+    """从单篇文档中抽取候选短语并计算局部权重。"""
+
     title_terms = tokenize_terms(document.title)
     body_terms = tokenize_terms(document.body)
     title_phrases = _phrases_from_terms(title_terms)
@@ -380,6 +795,8 @@ def _document_phrases(document: NewsDocument) -> Counter[str]:
 
 
 def _phrases_from_terms(terms: list[str]) -> list[str]:
+    """从词项序列中生成 1-3 gram 候选短语。"""
+
     phrases: list[str] = []
     for size in (3, 2, 1):
         for index in range(0, len(terms) - size + 1):
@@ -387,13 +804,21 @@ def _phrases_from_terms(terms: list[str]) -> list[str]:
             if len(set(phrase_terms)) != len(phrase_terms):
                 continue
             phrase = " ".join(phrase_terms)
-            if size == 1 and phrase in STOPWORDS:
+            if size == 1 and not _is_allowed_single_word_topic(phrase):
                 continue
             phrases.append(phrase)
     return phrases
 
 
+def _is_allowed_single_word_topic(word: str) -> bool:
+    """只允许少量强信号单词独立成为主题，避免泛词污染候选列表。"""
+
+    return word in SIGNAL_SHORT_WORDS
+
+
 def _phrase_weight(phrase: str, *, title: bool) -> float:
+    """根据短语长度、出现位置和信号词给短语加权。"""
+
     size = len(phrase.split())
     weight = 1.0 + (size - 1) * 1.2
     if title:
@@ -404,6 +829,8 @@ def _phrase_weight(phrase: str, *, title: bool) -> float:
 
 
 def _merge_similar_buckets(buckets: list[_TopicBucket]) -> list[_TopicBucket]:
+    """把高度相似的短语桶合并，减少候选主题碎片。"""
+
     ordered = sorted(
         buckets,
         key=lambda item: (len(item.evidence_by_uid), item.score, len(item.phrase)),
@@ -427,6 +854,8 @@ def _merge_similar_buckets(buckets: list[_TopicBucket]) -> list[_TopicBucket]:
 
 
 def _phrase_similarity(left: str, right: str) -> Decimal:
+    """计算两个短语的词项重叠相似度。"""
+
     left_terms = set(left.split())
     right_terms = set(right.split())
     if not left_terms or not right_terms:
@@ -441,6 +870,8 @@ def _best_existing_match(
     bucket: _TopicBucket,
     existing_topics: list[ExistingTopicSignature],
 ) -> tuple[str | None, Decimal]:
+    """寻找候选主题与现有正式主题的最佳匹配。"""
+
     candidate_terms = set(bucket.phrase.split())
     candidate_terms.update(bucket.keyword_scores)
     if not candidate_terms:
@@ -466,6 +897,8 @@ def _best_existing_match(
 
 
 def _rank_keywords(bucket: _TopicBucket) -> list[str]:
+    """按桶内权重选出主题关键词。"""
+
     keywords: list[str] = [bucket.phrase]
     for keyword, _score in bucket.keyword_scores.most_common(12):
         if keyword not in keywords and len(keyword) >= 2:
@@ -476,6 +909,8 @@ def _rank_keywords(bucket: _TopicBucket) -> list[str]:
 
 
 def _rank_evidence(bucket: _TopicBucket, *, limit: int) -> list[dict[str, Any]]:
+    """按发布时间和来源排序主题证据。"""
+
     evidence = list(bucket.evidence_by_uid.values())
     evidence.sort(
         key=lambda item: (
@@ -489,6 +924,8 @@ def _rank_evidence(bucket: _TopicBucket, *, limit: int) -> list[dict[str, Any]]:
 
 
 def _format_time(value: datetime | date | None) -> str | None:
+    """把日期时间对象转换成可入 JSON 的 ISO 字符串。"""
+
     if value is None:
         return None
     return value.isoformat()

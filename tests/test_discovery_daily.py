@@ -42,7 +42,6 @@ class DiscoveryDailyTest(unittest.TestCase):
             patch.object(daily, "fetch_fact_counts", return_value={}),
             patch.object(daily, "fetch_recent_finnhub_articles", return_value=[]),
             patch.object(daily, "fetch_recent_gdelt_articles", return_value=[]),
-            patch.object(daily, "fetch_recent_reddit_posts", return_value=[]),
             patch.object(daily, "fetch_recent_sec_filings", return_value=[]),
             patch.object(daily, "upsert_daily_watchlist"),
         ):
@@ -50,7 +49,6 @@ class DiscoveryDailyTest(unittest.TestCase):
                 database_url=database_url,
                 skip_finnhub_sync=True,
                 skip_gdelt_sync=True,
-                skip_reddit_sync=True,
                 skip_sec_sync=True,
             )
 
@@ -154,112 +152,6 @@ class DiscoveryDailyTest(unittest.TestCase):
         self.assertEqual(scores[0].rank, 1)
         self.assertGreater(scores[0].score, Decimal("30"))
         self.assertEqual(scores[0].primary_topic_slug, "ai_infrastructure")
-
-    def test_reddit_mentions_boost_existing_candidates_but_do_not_rank_alone(self) -> None:
-        topic = daily.DEFAULT_MARKET_TOPICS[0]
-        universe = {
-            "NVDA": {
-                "ticker": "NVDA",
-                "company_name": "NVIDIA Corporation",
-                "sector": "Technology",
-                "industry": "Semiconductors",
-                "business_description": "GPU and AI accelerator company",
-                "market_cap_usd": Decimal("3000000000000"),
-                "avg_volume_30d": Decimal("40000000"),
-                "is_active": True,
-            }
-        }
-        candidates: dict[str, daily.CandidateAccumulator] = {}
-
-        mentions = daily.build_reddit_mentions(
-            posts=[
-                {
-                    "post_uid": "reddit:t3_abc123",
-                    "subreddit": "wallstreetbets",
-                    "title": "$NVDA AI datacenter demand is everywhere",
-                    "selftext": "Discussion about GPU supply.",
-                    "permalink_url": "https://www.reddit.com/r/wallstreetbets/comments/abc123/example/",
-                    "score": 500,
-                    "comment_count": 120,
-                    "candidate_tickers": ["NVDA"],
-                    "candidate_keywords": ["datacenter", "gpu"],
-                    "created_utc": datetime(2026, 6, 10, tzinfo=timezone.utc),
-                }
-            ],
-            topics=[topic],
-            universe=universe,
-            candidates=candidates,
-        )
-
-        self.assertEqual(len(mentions), 1)
-        self.assertEqual(mentions[0].source_type, "reddit_post")
-        self.assertEqual(candidates["NVDA"].reddit_post_uids, {"reddit:t3_abc123"})
-
-        scores = daily.rank_candidates(
-            candidates,
-            run_date=daily.parse_run_date("2026-06-10"),
-            top_n=5,
-        )
-        self.assertEqual(scores, ())
-
-        candidates["NVDA"].finnhub_article_uids.add("finnhub:1")
-        scores = daily.rank_candidates(
-            candidates,
-            run_date=daily.parse_run_date("2026-06-10"),
-            top_n=5,
-        )
-        self.assertEqual(scores[0].reddit_post_count, 1)
-        self.assertGreater(scores[0].reddit_score, Decimal("0"))
-
-    def test_reddit_sync_skips_legacy_oauth_when_all_settings_missing(self) -> None:
-        warnings: list[str] = []
-
-        with (
-            patch.object(
-                daily.reddit,
-                "reddit_oauth_missing_settings",
-                return_value=(
-                    "REDDIT_CLIENT_ID",
-                    "REDDIT_CLIENT_SECRET",
-                    "REDDIT_USER_AGENT",
-                ),
-            ),
-            patch.object(daily.reddit, "make_reddit_client") as make_client,
-        ):
-            counts = daily.maybe_sync_reddit_subreddits(
-                database_url="postgresql://example/discovery",
-                subreddits=("stocks",),
-                listing="new",
-                limit=50,
-                warnings=warnings,
-            )
-
-        self.assertEqual(counts, {})
-        self.assertEqual(warnings, [])
-        make_client.assert_not_called()
-
-    def test_reddit_sync_warns_when_legacy_oauth_is_partially_configured(self) -> None:
-        warnings: list[str] = []
-
-        with (
-            patch.object(
-                daily.reddit,
-                "reddit_oauth_missing_settings",
-                return_value=("REDDIT_USER_AGENT",),
-            ),
-            patch.object(daily.reddit, "make_reddit_client") as make_client,
-        ):
-            counts = daily.maybe_sync_reddit_subreddits(
-                database_url="postgresql://example/discovery",
-                subreddits=("stocks",),
-                listing="new",
-                limit=50,
-                warnings=warnings,
-            )
-
-        self.assertEqual(counts, {})
-        self.assertEqual(warnings, ["Reddit OAuth 未同步: 缺少 REDDIT_USER_AGENT"])
-        make_client.assert_not_called()
 
 
 if __name__ == "__main__":

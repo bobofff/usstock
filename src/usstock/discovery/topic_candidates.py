@@ -15,6 +15,7 @@ from usstock.discovery.daily import (
     fetch_active_topics,
     fetch_recent_finnhub_articles,
     fetch_recent_gdelt_articles,
+    fetch_stock_universe,
     get_database_url,
 )
 from usstock.trends.extract import (
@@ -55,6 +56,8 @@ def run_topic_extraction(
     include_existing_matches: bool = False,
     dry_run: bool = False,
 ) -> TopicExtractionResult:
+    """运行候选主题抽取流程，并按需写入候选主题表。"""
+
     database_url = get_database_url(database_url)
     stats: dict[str, Any] = {
         "migrations_applied": 0 if dry_run else ensure_discovery_schema(database_url),
@@ -62,6 +65,7 @@ def run_topic_extraction(
 
     with psycopg.connect(database_url, autocommit=False) as conn:
         topics = fetch_active_topics(conn)
+        stock_universe = fetch_stock_universe(conn)
         finnhub_articles = fetch_recent_finnhub_articles(
             conn,
             lookback_hours=lookback_hours,
@@ -82,6 +86,8 @@ def run_topic_extraction(
             min_articles=min_articles,
             min_score=min_score,
             include_existing_matches=include_existing_matches,
+            known_tickers=stock_universe,
+            growth_window_hours=min(24, max(1, lookback_hours // 2)),
         )
 
         stats.update(
@@ -90,6 +96,7 @@ def run_topic_extraction(
                 "recent_finnhub_articles": len(finnhub_articles),
                 "recent_gdelt_articles": len(gdelt_articles),
                 "news_documents": len(documents),
+                "known_tickers": len(stock_universe),
                 "extracted_candidates": len(candidates),
                 "dry_run": dry_run,
             }
@@ -114,6 +121,8 @@ def build_news_documents(
     finnhub_articles: list[dict[str, Any]],
     gdelt_articles: list[dict[str, Any]],
 ) -> list[NewsDocument]:
+    """把 Finnhub 和 GDELT 文章转换成统一新闻文档。"""
+
     documents: list[NewsDocument] = []
 
     for article in finnhub_articles:
@@ -158,6 +167,8 @@ def build_news_documents(
 
 
 def active_topic_signatures(topics: list[Any]) -> list[ExistingTopicSignature]:
+    """把当前启用主题转换为抽取器可匹配的主题签名。"""
+
     return build_existing_topic_signatures(
         [
             {
@@ -177,6 +188,8 @@ def upsert_topic_candidates(
     *,
     lookback_hours: int,
 ) -> int:
+    """把候选主题按 slug 写入或刷新到数据库。"""
+
     count = 0
     for candidate in candidates:
         metadata = dict(candidate.metadata)
@@ -266,6 +279,8 @@ def promote_topic_candidates(
     limit: int = 10,
     activate: bool = False,
 ) -> TopicPromotionResult:
+    """把满足条件的候选主题晋升到正式主题库。"""
+
     database_url = get_database_url(database_url)
     stats: dict[str, Any] = {
         "migrations_applied": ensure_discovery_schema(database_url),
@@ -305,6 +320,8 @@ def fetch_promotable_candidates(
     min_articles: int,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """查询可以晋升的候选主题。"""
+
     if slugs:
         rows = conn.execute(
             """
@@ -356,6 +373,8 @@ def insert_promoted_topics(
     *,
     activate: bool,
 ) -> list[str]:
+    """把候选主题内容写入正式主题表。"""
+
     promoted: list[str] = []
     for row in rows:
         metadata = dict(row["metadata"])
@@ -405,6 +424,8 @@ def insert_promoted_topics(
 
 
 def mark_candidates_promoted(conn: Connection, slugs: list[str]) -> None:
+    """把已晋升的候选主题标记为 promoted。"""
+
     if not slugs:
         return
     conn.execute(
@@ -419,7 +440,37 @@ def mark_candidates_promoted(conn: Connection, slugs: list[str]) -> None:
     )
 
 
+def ignore_topic_candidates(
+    *,
+    database_url: str | None = None,
+    slugs: tuple[str, ...] = (),
+) -> int:
+    """把待审核候选主题标记为 ignored，保留历史证据但不再待审。"""
+
+    if not slugs:
+        return 0
+
+    database_url = get_database_url(database_url)
+    ensure_discovery_schema(database_url)
+    with psycopg.connect(database_url, autocommit=False) as conn:
+        with conn.transaction():
+            rows = conn.execute(
+                """
+                UPDATE market_topic_candidates
+                SET status = 'ignored',
+                    updated_at = now()
+                WHERE status = 'pending'
+                  AND candidate_slug = ANY(%s)
+                RETURNING candidate_slug
+                """,
+                (list(slugs),),
+            ).fetchall()
+    return len(rows)
+
+
 def render_extraction_result(result: TopicExtractionResult) -> str:
+    """渲染候选主题抽取命令的终端输出。"""
+
     lines = [
         "[完成] 新闻候选主题抽取",
         (
@@ -441,6 +492,8 @@ def render_extraction_result(result: TopicExtractionResult) -> str:
 
 
 def render_promotion_result(result: TopicPromotionResult) -> str:
+    """渲染候选主题晋升命令的终端输出。"""
+
     if not result.promoted_slugs:
         return "[完成] 未晋升新的正式主题。"
     slugs = ", ".join(result.promoted_slugs)

@@ -14,6 +14,8 @@ DEFAULT_MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 
 
 def _strip_optional_quotes(value: str) -> str:
+    """去掉 .env 值两侧成对的单引号或双引号。"""
+
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
@@ -21,7 +23,7 @@ def _strip_optional_quotes(value: str) -> str:
 
 
 def read_env_file(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
-    """Read simple KEY=VALUE pairs from an env file."""
+    """读取简单 KEY=VALUE 形式的 .env 配置。"""
 
     if not path.exists():
         return {}
@@ -44,7 +46,7 @@ def read_env_file(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class Settings:
-    """Runtime settings loaded from environment variables and .env."""
+    """从环境变量和 .env 读取后的运行时配置。"""
 
     database_url: str | None
     migrations_dir: Path
@@ -60,18 +62,12 @@ class Settings:
     finnhub_base_url: str
     finnhub_rate_limit_per_second: float
     finnhub_request_timeout_seconds: float
-    reddit_client_id: str | None
-    reddit_client_secret: str | None
-    reddit_user_agent: str | None
-    reddit_base_url: str
-    reddit_oauth_url: str
-    reddit_rate_limit_per_second: float
-    reddit_request_timeout_seconds: float
-    reddit_devvit_webhook_secret: str | None
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """加载并缓存应用配置，避免每次访问都重复读取环境。"""
+
     env_file_values = read_env_file()
 
     database_url = os.environ.get("DATABASE_URL") or env_file_values.get("DATABASE_URL")
@@ -139,38 +135,6 @@ def get_settings() -> Settings:
         or env_file_values.get("FINNHUB_REQUEST_TIMEOUT_SECONDS")
         or "30"
     )
-    reddit_client_id = os.environ.get("REDDIT_CLIENT_ID") or env_file_values.get(
-        "REDDIT_CLIENT_ID"
-    )
-    reddit_client_secret = os.environ.get(
-        "REDDIT_CLIENT_SECRET"
-    ) or env_file_values.get("REDDIT_CLIENT_SECRET")
-    reddit_user_agent = os.environ.get("REDDIT_USER_AGENT") or env_file_values.get(
-        "REDDIT_USER_AGENT"
-    )
-    reddit_base_url = (
-        os.environ.get("REDDIT_BASE_URL")
-        or env_file_values.get("REDDIT_BASE_URL")
-        or "https://oauth.reddit.com"
-    ).rstrip("/")
-    reddit_oauth_url = (
-        os.environ.get("REDDIT_OAUTH_URL")
-        or env_file_values.get("REDDIT_OAUTH_URL")
-        or "https://www.reddit.com/api/v1/access_token"
-    )
-    reddit_rate_limit_per_second = float(
-        os.environ.get("REDDIT_RATE_LIMIT_PER_SECOND")
-        or env_file_values.get("REDDIT_RATE_LIMIT_PER_SECOND")
-        or "0.5"
-    )
-    reddit_request_timeout_seconds = float(
-        os.environ.get("REDDIT_REQUEST_TIMEOUT_SECONDS")
-        or env_file_values.get("REDDIT_REQUEST_TIMEOUT_SECONDS")
-        or "30"
-    )
-    reddit_devvit_webhook_secret = os.environ.get(
-        "REDDIT_DEVVIT_WEBHOOK_SECRET"
-    ) or env_file_values.get("REDDIT_DEVVIT_WEBHOOK_SECRET")
 
     migrations_dir = Path(migrations_dir_value).expanduser()
     if not migrations_dir.is_absolute():
@@ -191,12 +155,4 @@ def get_settings() -> Settings:
         finnhub_base_url=finnhub_base_url,
         finnhub_rate_limit_per_second=finnhub_rate_limit_per_second,
         finnhub_request_timeout_seconds=finnhub_request_timeout_seconds,
-        reddit_client_id=reddit_client_id,
-        reddit_client_secret=reddit_client_secret,
-        reddit_user_agent=reddit_user_agent,
-        reddit_base_url=reddit_base_url,
-        reddit_oauth_url=reddit_oauth_url,
-        reddit_rate_limit_per_second=reddit_rate_limit_per_second,
-        reddit_request_timeout_seconds=reddit_request_timeout_seconds,
-        reddit_devvit_webhook_secret=reddit_devvit_webhook_secret,
     )

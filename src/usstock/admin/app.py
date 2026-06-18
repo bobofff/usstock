@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import hmac
 import html
-import json
+import math
 import sys
 import threading
 import traceback
@@ -24,7 +23,7 @@ from psycopg.rows import dict_row
 
 from usstock.config.settings import get_settings
 from usstock.data import finnhub
-from usstock.data import gdelt, reddit, sec
+from usstock.data import gdelt, sec
 from usstock.discovery import daily as discovery
 from usstock.discovery import topic_candidates
 
@@ -32,15 +31,37 @@ from usstock.discovery import topic_candidates
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 PAGE_SIZE = 100
+TABLE_PAGE_SIZE = 15
 MAX_POST_BYTES = 64 * 1024
-MAX_JSON_POST_BYTES = 4 * 1024 * 1024
-DEVVIT_JSON_PATHS = {
-    "/api/reddit/devvit/posts",
-    "/api/reddit/devvit/matches",
-}
+TOPIC_CLOUD_SIZE = 420
+TOPIC_CLOUD_RADIUS = 186
+TOPIC_CLOUD_MAX_TERMS = 54
+TOPIC_CLOUD_TEXT_LIMIT = 28
+TOPIC_CLOUD_PALETTE = (
+    "#2563eb",
+    "#db2777",
+    "#0f766e",
+    "#7c3aed",
+    "#c2410c",
+    "#0891b2",
+    "#be123c",
+    "#4d7c0f",
+)
 PICO_CSS_URL = "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
 HTMX_JS_URL = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
 ALPINE_JS_URL = "https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"
+TOPIC_PANES = [
+    ("overview", "概览"),
+    ("library", "主题库"),
+    ("candidates", "候选主题"),
+    ("mentions", "主题提及"),
+    ("scores", "候选评分"),
+]
+TASK_PANES = [
+    ("discovery", "自动发现"),
+    ("manual", "手动补数"),
+    ("topic-extraction", "主题后处理"),
+]
 
 
 @dataclass(frozen=True)
@@ -53,7 +74,6 @@ class DiscoveryRunConfig:
     include_company_facts: bool
     skip_finnhub_sync: bool
     skip_gdelt_sync: bool
-    skip_reddit_sync: bool
     skip_sec_sync: bool
 
 
@@ -213,7 +233,6 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "/sec": render_sec_filings,
             "/gdelt": render_gdelt,
             "/finnhub": render_finnhub,
-            "/reddit": render_reddit,
             "/topics": render_topics,
             "/tasks": render_tasks,
         }
@@ -233,29 +252,11 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length", "0") or "0")
-        max_post_bytes = (
-            MAX_JSON_POST_BYTES
-            if parsed.path in DEVVIT_JSON_PATHS
-            else MAX_POST_BYTES
-        )
-        if length > max_post_bytes:
-            if parsed.path in DEVVIT_JSON_PATHS:
-                self.send_json(
-                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    {"ok": False, "error": "请求内容过大。"},
-                )
-                return
+        if length > MAX_POST_BYTES:
             self.redirect("/tasks", "请求内容过大。", ok=False)
             return
 
         raw_bytes = self.rfile.read(length)
-        if parsed.path == "/api/reddit/devvit/posts":
-            self.handle_devvit_reddit_posts(raw_bytes)
-            return
-        if parsed.path == "/api/reddit/devvit/matches":
-            self.handle_devvit_reddit_matches(raw_bytes)
-            return
-
         raw_body = raw_bytes.decode("utf-8")
         form = urllib.parse.parse_qs(raw_body)
 
@@ -363,47 +364,6 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if parsed.path == "/actions/reddit-defaults":
-                require_reddit_oauth_admin_sync()
-                listing = form_value(form, "listing") or reddit.DEFAULT_LISTING
-                limit = parse_positive_int(form_value(form, "limit")) or 50
-                counts = reddit.sync_default_subreddits(
-                    listing=listing,
-                    limit=limit,
-                    database_url=database_url,
-                )
-                total = sum(counts.values())
-                detail = "，".join(f"r/{name}={count}" for name, count in counts.items())
-                self.redirect(
-                    "/reddit",
-                    f"Reddit 默认社区同步完成：{total} 条。{detail}",
-                    ok=True,
-                )
-                return
-
-            if parsed.path == "/actions/reddit-subreddit":
-                require_reddit_oauth_admin_sync()
-                subreddit = form_value(form, "subreddit")
-                if not subreddit:
-                    raise AdminPanelError("subreddit 不能为空。")
-
-                listing = form_value(form, "listing") or reddit.DEFAULT_LISTING
-                limit = parse_positive_int(form_value(form, "limit")) or 50
-                time_filter = form_value(form, "time_filter") or None
-                count = reddit.sync_subreddit_posts(
-                    subreddit=subreddit,
-                    listing=listing,
-                    limit=limit,
-                    time_filter=time_filter,
-                    database_url=database_url,
-                )
-                self.redirect(
-                    "/reddit",
-                    f"Reddit r/{reddit.normalize_subreddit(subreddit)} 同步完成：{count} 条。",
-                    ok=True,
-                )
-                return
-
             if parsed.path == "/actions/discovery-daily":
                 config = parse_discovery_run_config(form)
                 result = run_discovery_daily(database_url, config)
@@ -444,6 +404,53 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path == "/actions/topic-promote":
+                slug = form_value(form, "candidate_slug")
+                if not slug:
+                    raise AdminPanelError("候选主题 slug 不能为空。")
+
+                result = topic_candidates.promote_topic_candidates(
+                    database_url=database_url,
+                    slugs=(slug,),
+                    activate=form_bool(form, "activate"),
+                )
+                if result.promoted_slugs:
+                    self.redirect(
+                        "/topics?pane=candidates",
+                        f"{slug} 已晋升为正式主题。",
+                        ok=True,
+                    )
+                else:
+                    self.redirect(
+                        "/topics?pane=candidates",
+                        f"{slug} 未晋升：请确认它仍是待审核状态，且未匹配已有正式主题。",
+                        ok=False,
+                    )
+                return
+
+            if parsed.path == "/actions/topic-ignore":
+                slug = form_value(form, "candidate_slug")
+                if not slug:
+                    raise AdminPanelError("候选主题 slug 不能为空。")
+
+                count = topic_candidates.ignore_topic_candidates(
+                    database_url=database_url,
+                    slugs=(slug,),
+                )
+                if count:
+                    self.redirect(
+                        "/topics?pane=candidates",
+                        f"{slug} 已忽略，后续抽取不会把它恢复为待审核。",
+                        ok=True,
+                    )
+                else:
+                    self.redirect(
+                        "/topics?pane=candidates",
+                        f"{slug} 未忽略：请确认它仍是待审核状态。",
+                        ok=False,
+                    )
+                return
+
             if parsed.path == "/actions/discovery-schedule-start":
                 config = parse_discovery_run_config(form)
                 interval_minutes = (
@@ -477,75 +484,12 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self.redirect("/tasks", "未知操作。", ok=False)
         except Exception as exc:  # pragma: no cover - keeps the panel usable.
             traceback.print_exc()
-            redirect_path = (
-                "/reddit"
-                if parsed.path.startswith("/actions/reddit-")
+            fallback_path = (
+                "/topics?pane=candidates"
+                if parsed.path in {"/actions/topic-promote", "/actions/topic-ignore"}
                 else "/tasks"
             )
-            self.redirect(redirect_path, f"操作失败：{exc}", ok=False)
-
-    def handle_devvit_reddit_posts(self, raw_body: bytes) -> None:
-        try:
-            self.authorize_devvit_webhook()
-            payload = json.loads(raw_body.decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise AdminPanelError("Devvit payload 必须是 JSON 对象。")
-            count = reddit.ingest_devvit_payload(
-                payload,
-                database_url=self.resolve_database_url(),
-            )
-            self.send_json(HTTPStatus.OK, {"ok": True, "imported": count})
-        except json.JSONDecodeError as exc:
-            self.send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": f"JSON 解析失败：{exc}"},
-            )
-        except PermissionError as exc:
-            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": str(exc)})
-        except Exception as exc:  # pragma: no cover - API safety net.
-            traceback.print_exc()
-            self.send_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"ok": False, "error": str(exc)},
-            )
-
-    def handle_devvit_reddit_matches(self, raw_body: bytes) -> None:
-        try:
-            self.authorize_devvit_webhook()
-            payload = json.loads(raw_body.decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise AdminPanelError("Devvit match payload 必须是 JSON 对象。")
-            counts = reddit.ingest_devvit_match_payload(
-                payload,
-                database_url=self.resolve_database_url(),
-            )
-            self.send_json(HTTPStatus.OK, {"ok": True, **counts})
-        except json.JSONDecodeError as exc:
-            self.send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": f"JSON 解析失败：{exc}"},
-            )
-        except PermissionError as exc:
-            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": str(exc)})
-        except Exception as exc:  # pragma: no cover - API safety net.
-            traceback.print_exc()
-            self.send_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"ok": False, "error": str(exc)},
-            )
-
-    def authorize_devvit_webhook(self) -> None:
-        secret = get_settings().reddit_devvit_webhook_secret
-        if not secret:
-            raise PermissionError("缺少 REDDIT_DEVVIT_WEBHOOK_SECRET，拒绝 Devvit webhook。")
-
-        auth_header = self.headers.get("Authorization", "")
-        token = ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-        token = token or self.headers.get("X-Usstock-Webhook-Secret", "").strip()
-        if not hmac.compare_digest(token, secret):
-            raise PermissionError("Devvit webhook 密钥无效。")
+            self.redirect(fallback_path, f"操作失败：{exc}", ok=False)
 
     def resolve_database_url(self) -> str | None:
         return self.server.database_url
@@ -557,22 +501,15 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 "notice_type": "ok" if ok else "error",
             }
         )
+        separator = "&" if "?" in path else "?"
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", f"{path}?{params}")
+        self.send_header("Location", f"{path}{separator}{params}")
         self.end_headers()
 
     def send_html(self, status: HTTPStatus, body: str) -> None:
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def send_json(self, status: HTTPStatus, body: dict[str, Any]) -> None:
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -596,41 +533,9 @@ def connect_database(database_url: str | None) -> Connection[dict[str, Any]]:
     )
 
 
-def require_reddit_oauth_admin_sync() -> None:
-    missing_settings = reddit.reddit_oauth_missing_settings()
-    if not missing_settings:
-        return
-
-    missing = ", ".join(missing_settings)
-    raise AdminPanelError(
-        "旧 Reddit OAuth 备用同步未启用，"
-        f"缺少 {missing}。"
-        "当前 Devvit 主链路不需要 client_id；请在 Devvit app 菜单触发同步，"
-        "或等待 Devvit 定时任务推送到本项目 webhook。"
-    )
-
-
 def table_exists(conn: Connection[dict[str, Any]], table_name: str) -> bool:
     row = conn.execute("SELECT to_regclass(%s) AS table_name", (table_name,)).fetchone()
     return bool(row and row["table_name"])
-
-
-def column_exists(
-    conn: Connection[dict[str, Any]],
-    table_name: str,
-    column_name: str,
-) -> bool:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = %s
-          AND column_name = %s
-        """,
-        (table_name, column_name),
-    ).fetchone()
-    return bool(row)
 
 
 def fetch_one(
@@ -665,8 +570,6 @@ def render_dashboard(
                 "gdelt_doc_queries": table_exists(conn, "gdelt_doc_queries"),
                 "finnhub_articles": table_exists(conn, "finnhub_articles"),
                 "finnhub_news_queries": table_exists(conn, "finnhub_news_queries"),
-                "reddit_posts": table_exists(conn, "reddit_posts"),
-                "reddit_post_queries": table_exists(conn, "reddit_post_queries"),
                 "market_topics": table_exists(conn, "market_topics"),
                 "market_topic_candidates": table_exists(conn, "market_topic_candidates"),
                 "topic_mentions": table_exists(conn, "topic_mentions"),
@@ -749,28 +652,6 @@ def render_dashboard(
                 if tables["finnhub_news_queries"]
                 else {}
             )
-            reddit_summary = (
-                fetch_one(
-                    conn,
-                    """
-                    SELECT
-                        count(*) AS total,
-                        count(*) FILTER (
-                            WHERE created_utc >= now() - interval '24 hours'
-                        ) AS recent,
-                        count(DISTINCT subreddit) AS subreddits,
-                        max(created_utc) AS latest_created_at
-                    FROM reddit_posts
-                    """,
-                )
-                if tables["reddit_posts"]
-                else {}
-            )
-            reddit_query_summary = (
-                fetch_one(conn, "SELECT count(*) AS total FROM reddit_post_queries")
-                if tables["reddit_post_queries"]
-                else {}
-            )
             topic_summary = (
                 fetch_one(
                     conn,
@@ -815,6 +696,72 @@ def render_dashboard(
                 )
                 if tables["market_topic_candidates"]
                 else {}
+            )
+            if tables["market_topics"] and tables["topic_mentions"]:
+                topic_cloud_rows = fetch_all(
+                    conn,
+                    """
+                    SELECT mt.topic_slug, mt.topic_name, mt.gdelt_query,
+                           mt.keywords, mt.ticker_hints, mt.priority,
+                           mt.is_active, mt.last_refreshed_at,
+                           count(tm.id) AS mention_count,
+                           count(tm.id) FILTER (
+                               WHERE tm.detected_at >= now() - interval '24 hours'
+                           ) AS recent_mentions,
+                           count(DISTINCT tm.ticker) FILTER (
+                               WHERE tm.ticker IS NOT NULL
+                           ) AS ticker_count
+                    FROM market_topics mt
+                    LEFT JOIN topic_mentions tm ON tm.topic_slug = mt.topic_slug
+                    GROUP BY mt.topic_slug, mt.topic_name, mt.gdelt_query,
+                             mt.keywords, mt.ticker_hints, mt.priority,
+                             mt.is_active, mt.last_refreshed_at
+                    ORDER BY mt.is_active DESC, recent_mentions DESC,
+                             mt.priority, mt.topic_slug
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+            elif tables["market_topics"]:
+                topic_cloud_rows = fetch_all(
+                    conn,
+                    """
+                    SELECT topic_slug, topic_name, gdelt_query, keywords,
+                           ticker_hints, priority, is_active, last_refreshed_at,
+                           0 AS mention_count, 0 AS recent_mentions, 0 AS ticker_count
+                    FROM market_topics
+                    ORDER BY is_active DESC, priority, topic_slug
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+            else:
+                topic_cloud_rows = []
+
+            topic_candidate_cloud_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT candidate_slug, topic_name, gdelt_query, keywords,
+                           ticker_hints, source_types, article_count,
+                           source_count, ticker_count, trend_score,
+                           novelty_score, status, matched_topic_slug,
+                           evidence, last_seen_at
+                    FROM market_topic_candidates
+                    ORDER BY
+                        CASE status
+                            WHEN 'pending' THEN 0
+                            WHEN 'promoted' THEN 1
+                            ELSE 2
+                        END,
+                        trend_score DESC,
+                        last_seen_at DESC
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+                if tables["market_topic_candidates"]
+                else []
             )
             migrations = (
                 fetch_all(
@@ -870,20 +817,6 @@ def render_dashboard(
                 if tables["finnhub_articles"]
                 else []
             )
-            recent_reddit_posts = (
-                fetch_all(
-                    conn,
-                    """
-                    SELECT title, subreddit, candidate_tickers, score,
-                           comment_count, created_utc, permalink_url
-                    FROM reddit_posts
-                    ORDER BY coalesce(created_utc, last_seen_at) DESC
-                    LIMIT 8
-                    """,
-                )
-                if tables["reddit_posts"]
-                else []
-            )
     except Exception as exc:
         return render_database_error(exc, active="/")
 
@@ -916,16 +849,6 @@ def render_dashboard(
             "market / company",
         ),
         metric_box(
-            "Reddit 帖子",
-            reddit_summary.get("total"),
-            f"近 24 小时 {fmt(reddit_summary.get('recent'))}",
-        ),
-        metric_box(
-            "Reddit 查询",
-            reddit_query_summary.get("total"),
-            f"社区 {fmt(reddit_summary.get('subreddits'))}",
-        ),
-        metric_box(
             "主题",
             topic_summary.get("total"),
             f"启用 {fmt(topic_summary.get('active'))} / 24h 提及 {fmt(topic_mention_summary.get('recent'))}",
@@ -943,6 +866,10 @@ def render_dashboard(
       <a class="button primary" href="/tasks">同步数据</a>
     </section>
     <section class="metrics">{"".join(metrics)}</section>
+    <section class="split topic-clouds">
+      {render_topic_cloud_panel("主题词云", topic_cloud_rows, cloud_type="topics")}
+      {render_topic_cloud_panel("候选主题词云", topic_candidate_cloud_rows, cloud_type="candidates")}
+    </section>
     <section class="split">
       <div>
         <h2>最近 SEC 公告</h2>
@@ -955,10 +882,6 @@ def render_dashboard(
       <div>
         <h2>最近 Finnhub 新闻</h2>
         {render_finnhub_articles_table(recent_finnhub_articles, compact=True)}
-      </div>
-      <div>
-        <h2>最近 Reddit 帖子</h2>
-        {render_reddit_posts_table(recent_reddit_posts, compact=True)}
       </div>
     </section>
     <section>
@@ -1397,325 +1320,54 @@ def render_finnhub(
     return layout("Finnhub", body, active="/finnhub", query=query)
 
 
-def render_reddit_sync_cards(*, subreddit_value: str = "") -> str:
-    settings = get_settings()
-    missing_oauth_settings = reddit.reddit_oauth_missing_settings()
-    oauth_ready = not missing_oauth_settings
-    oauth_disabled = "" if oauth_ready else " disabled"
-    oauth_hint = (
-        "传统 Reddit OAuth 已配置，可作为 Devvit 备用手动拉取。"
-        if oauth_ready
-        else (
-            f"旧 OAuth 备用未启用，缺少 {', '.join(missing_oauth_settings)}；"
-            "Devvit 同步不需要这些变量。"
-        )
-    )
-    webhook_hint = (
-        "已配置 REDDIT_DEVVIT_WEBHOOK_SECRET。"
-        if settings.reddit_devvit_webhook_secret
-        else "未配置 REDDIT_DEVVIT_WEBHOOK_SECRET，Devvit webhook 会被拒绝。"
-    )
-    listing_options = render_select_options(
-        sorted(reddit.VALID_LISTINGS),
-        reddit.DEFAULT_LISTING,
-    )
-    time_filter_options = render_select_options(
-        sorted(reddit.VALID_TIME_FILTERS),
-        reddit.DEFAULT_TIME_FILTER,
-    )
-    post_limit_input = (
-        '<input name="limit" type="number" min="1" max="100" value="50">'
-    )
-    subreddit_input = (
-        '<input name="subreddit" required placeholder="stocks" '
-        f'value="{e(subreddit_value)}">'
-    )
-    return f"""
-      <article class="task-card">
-        <h2>Devvit 主同步</h2>
-        <p>Devvit scheduler/menu 拉取 Reddit 帖子，并把数据推送到本项目 webhook。</p>
-        <p class="subtle">{e(webhook_hint)}</p>
-        <p><code>/api/reddit/devvit/posts</code><br><code>/api/reddit/devvit/matches</code></p>
-      </article>
-      <form method="post" action="/actions/reddit-defaults">
-        <h2>旧 OAuth 备用：默认社区</h2>
-        <p>{e(oauth_hint)}</p>
-        <label>listing <select name="listing">{listing_options}</select></label>
-        <label>帖子数量 {post_limit_input}</label>
-        <button class="primary" type="submit"{oauth_disabled}>备用同步默认社区</button>
-      </form>
-      <form method="post" action="/actions/reddit-subreddit">
-        <h2>旧 OAuth 备用：单个 subreddit</h2>
-        <p>{e(oauth_hint)}</p>
-        <label>subreddit {subreddit_input}</label>
-        <label>listing <select name="listing">{listing_options}</select></label>
-        <label>time filter <select name="time_filter">{time_filter_options}</select></label>
-        <label>帖子数量 {post_limit_input}</label>
-        <button class="primary" type="submit"{oauth_disabled}>备用同步社区</button>
-      </form>
-    """
-
-
-def render_reddit(
-    *,
-    database_url: str | None,
+def selected_pane(
     query: Mapping[str, list[str]],
+    *,
+    param: str,
+    panes: list[tuple[str, str]],
+    default: str,
 ) -> str:
-    q = form_value(query, "q")
-    subreddit_filter = form_value(query, "subreddit")
-    ticker = form_value(query, "ticker").upper()
-    settings = get_settings()
+    pane = form_value(query, param)
+    allowed = {key for key, _ in panes}
+    return pane if pane in allowed else default
 
-    try:
-        with connect_database(database_url) as conn:
-            has_posts = table_exists(conn, "reddit_posts")
-            has_queries = table_exists(conn, "reddit_post_queries")
-            has_comments = table_exists(conn, "reddit_comments")
-            summary = (
-                fetch_one(
-                    conn,
-                    """
-                    SELECT
-                        count(*) AS total,
-                        count(*) FILTER (
-                            WHERE created_utc >= now() - interval '24 hours'
-                        ) AS recent,
-                        count(DISTINCT subreddit) AS subreddits,
-                        sum(comment_count) AS comments,
-                        max(created_utc) AS latest_created_at
-                    FROM reddit_posts
-                    """,
-                )
-                if has_posts
-                else {}
-            )
-            comment_summary = (
-                fetch_one(
-                    conn,
-                    """
-                    SELECT
-                        count(*) AS total,
-                        count(*) FILTER (
-                            WHERE coalesce(created_utc, last_seen_at, created_at)
-                                  >= now() - interval '24 hours'
-                        ) AS recent,
-                        max(coalesce(created_utc, last_seen_at, created_at)) AS latest_at
-                    FROM reddit_comments
-                    """,
-                )
-                if has_comments
-                else {}
-            )
-            subreddit_rows = (
-                fetch_all(
-                    conn,
-                    """
-                    SELECT subreddit AS label,
-                           count(*) AS total,
-                           max(created_utc) AS latest_at
-                    FROM reddit_posts
-                    GROUP BY subreddit
-                    ORDER BY total DESC, label
-                    LIMIT 12
-                    """,
-                )
-                if has_posts
-                else []
-            )
-            ticker_rows = (
-                fetch_all(
-                    conn,
-                    """
-                    SELECT ticker AS label,
-                           count(*) AS total,
-                           max(created_utc) AS latest_at
-                    FROM reddit_posts
-                    CROSS JOIN LATERAL unnest(candidate_tickers) AS ticker
-                    GROUP BY ticker
-                    ORDER BY total DESC, label
-                    LIMIT 12
-                    """,
-                )
-                if has_posts
-                else []
-            )
-            post_conditions: list[str] = []
-            post_params: list[Any] = []
-            comment_conditions: list[str] = []
-            comment_params: list[Any] = []
-            query_conditions: list[str] = []
-            query_params: list[Any] = []
-            if q:
-                like = f"%{q}%"
-                post_conditions.append(
-                    """
-                    (
-                        title ILIKE %s OR coalesce(selftext, '') ILIKE %s
-                        OR coalesce(link_flair_text, '') ILIKE %s
-                    )
-                    """
-                )
-                post_params.extend([like, like, like])
-                comment_conditions.append(
-                    """
-                    (
-                        body ILIKE %s
-                        OR EXISTS (
-                            SELECT 1
-                            FROM unnest(matched_keywords) AS keyword
-                            WHERE keyword ILIKE %s
-                        )
-                    )
-                    """
-                )
-                comment_params.extend([like, like])
-            if subreddit_filter:
-                post_conditions.append("lower(subreddit) = lower(%s)")
-                post_params.append(subreddit_filter)
-                comment_conditions.append("lower(subreddit) = lower(%s)")
-                comment_params.append(subreddit_filter)
-                query_conditions.append("lower(subreddit) = lower(%s)")
-                query_params.append(subreddit_filter)
-            if ticker:
-                post_conditions.append("%s = ANY(candidate_tickers)")
-                post_params.append(ticker)
-                comment_conditions.append("%s = ANY(candidate_tickers)")
-                comment_params.append(ticker)
 
-            post_where = (
-                f"WHERE {' AND '.join(post_conditions)}"
-                if post_conditions
-                else ""
-            )
-            comment_where = (
-                f"WHERE {' AND '.join(comment_conditions)}"
-                if comment_conditions
-                else ""
-            )
-            query_where = (
-                f"WHERE {' AND '.join(query_conditions)}" if query_conditions else ""
-            )
-            posts = (
-                fetch_all(
-                    conn,
-                    f"""
-                    SELECT title, subreddit, candidate_tickers, candidate_keywords,
-                           score, upvote_ratio, comment_count, created_utc,
-                           permalink_url, link_flair_text
-                    FROM reddit_posts
-                    {post_where}
-                    ORDER BY coalesce(created_utc, last_seen_at) DESC
-                    LIMIT %s
-                    """,
-                    (*post_params, PAGE_SIZE),
-                )
-                if has_posts
-                else []
-            )
-            comments = (
-                fetch_all(
-                    conn,
-                    f"""
-                    SELECT body, subreddit, candidate_tickers, candidate_keywords,
-                           matched_keywords, score, created_utc, permalink_url,
-                           author_name, post_fullname
-                    FROM reddit_comments
-                    {comment_where}
-                    ORDER BY coalesce(created_utc, last_seen_at) DESC
-                    LIMIT %s
-                    """,
-                    (*comment_params, PAGE_SIZE),
-                )
-                if has_comments
-                else []
-            )
-            queries = (
-                fetch_all(
-                    conn,
-                    f"""
-                    SELECT subreddit, listing, time_filter, limit_count,
-                           after_token, fetched_at
-                    FROM reddit_post_queries
-                    {query_where}
-                    ORDER BY fetched_at DESC
-                    LIMIT 20
-                    """,
-                    tuple(query_params),
-                )
-                if has_queries
-                else []
-            )
-    except Exception as exc:
-        return render_database_error(exc, active="/reddit")
+def build_query_href(
+    path: str,
+    query: Mapping[str, list[str]],
+    updates: Mapping[str, str | None],
+) -> str:
+    params: dict[str, str] = {}
+    for key, values in query.items():
+        if key in {"notice", "notice_type"} or not values:
+            continue
+        params[key] = values[0]
+    for key, value in updates.items():
+        if value is None:
+            params.pop(key, None)
+        else:
+            params[key] = value
+    encoded = urllib.parse.urlencode(params)
+    return f"{path}?{encoded}" if encoded else path
 
-    oauth_ready = reddit.has_reddit_oauth_credentials()
-    metrics = [
-        metric_box(
-            "接入模式",
-            "Devvit",
-            "主同步链路",
-        ),
-        metric_box(
-            "Webhook 密钥",
-            "已配置" if settings.reddit_devvit_webhook_secret else "未配置",
-            "REDDIT_DEVVIT_WEBHOOK_SECRET",
-        ),
-        metric_box(
-            "旧 API 备用",
-            "可用" if oauth_ready else "未启用",
-            "Reddit OAuth",
-        ),
-        metric_box("帖子总数", summary.get("total"), "reddit_post"),
-        metric_box("近 24 小时", summary.get("recent"), "created_utc"),
-        metric_box(
-            "社区 / 评论",
-            f"{fmt(summary.get('subreddits'))} / {fmt(summary.get('comments'))}",
-            f"最近 {fmt(summary.get('latest_created_at'))}",
-        ),
-        metric_box(
-            "实时评论命中",
-            comment_summary.get("total"),
-            f"近 24 小时 {fmt(comment_summary.get('recent'))}",
-        ),
-    ]
-    body = f"""
-    <section class="toolbar">
-      <h1>Reddit</h1>
-      <form method="get" class="filters">
-        <input name="q" value="{e(q)}" placeholder="关键词 / flair">
-        <input name="subreddit" value="{e(subreddit_filter)}" placeholder="subreddit">
-        <input name="ticker" value="{e(ticker)}" placeholder="ticker">
-        <button type="submit">筛选</button>
-      </form>
-    </section>
-    <section class="metrics">{"".join(metrics)}</section>
-    <section class="task-grid">
-      {render_reddit_sync_cards(subreddit_value=subreddit_filter)}
-    </section>
-    <section class="split">
-      <div>
-        <h2>社区概览</h2>
-        {render_reddit_breakdown_table(subreddit_rows, empty_message="暂无 Reddit 社区统计。")}
-      </div>
-      <div>
-        <h2>候选 ticker</h2>
-        {render_reddit_breakdown_table(ticker_rows, empty_message="暂无 Reddit ticker 统计。")}
-      </div>
-    </section>
-    <section>
-      <h2>查询记录</h2>
-      {render_reddit_queries_table(queries)}
-    </section>
-    <section>
-      <h2>社区帖子</h2>
-      {render_reddit_posts_table(posts)}
-    </section>
-    <section>
-      <h2>实时命中评论</h2>
-      {render_reddit_comments_table(comments)}
-    </section>
-    """
-    return layout("Reddit", body, active="/reddit", query=query)
+
+def render_pane_breadcrumbs(
+    *,
+    path: str,
+    query: Mapping[str, list[str]],
+    param: str,
+    panes: list[tuple[str, str]],
+    active: str,
+) -> str:
+    items = []
+    for key, label in panes:
+        active_class = " active" if key == active else ""
+        aria_current = ' aria-current="page"' if key == active else ""
+        href = build_query_href(path, query, {param: key})
+        items.append(
+            f'<a class="pane-crumb{active_class}" href="{e(href)}"{aria_current}>{e(label)}</a>'
+        )
+    return f'<nav class="pane-breadcrumbs" aria-label="页面分区">{"".join(items)}</nav>'
 
 
 def render_topics(
@@ -1726,6 +1378,12 @@ def render_topics(
     topic_filter = form_value(query, "topic")
     ticker_filter = form_value(query, "ticker").upper()
     candidate_status_filter = form_value(query, "candidate_status")
+    pane = selected_pane(
+        query,
+        param="pane",
+        panes=TOPIC_PANES,
+        default="overview",
+    )
 
     try:
         with connect_database(database_url) as conn:
@@ -1733,11 +1391,6 @@ def render_topics(
             has_topic_candidates = table_exists(conn, "market_topic_candidates")
             has_mentions = table_exists(conn, "topic_mentions")
             has_scores = table_exists(conn, "daily_candidate_scores")
-            has_reddit_score_columns = has_scores and column_exists(
-                conn,
-                "daily_candidate_scores",
-                "reddit_post_count",
-            )
 
             summary = (
                 fetch_one(
@@ -1953,11 +1606,6 @@ def render_topics(
             score_where = (
                 f"WHERE {' AND '.join(score_conditions)}" if score_conditions else ""
             )
-            reddit_count_expr = (
-                "reddit_post_count"
-                if has_reddit_score_columns
-                else "0 AS reddit_post_count"
-            )
             score_rows = (
                 fetch_all(
                     conn,
@@ -1965,7 +1613,7 @@ def render_topics(
                     SELECT run_date, rank, ticker, company_name, score,
                            action_bias, primary_topic_slug, topic_slugs,
                            finnhub_article_count, gdelt_article_count,
-                           sec_filing_count, {reddit_count_expr}
+                           sec_filing_count
                     FROM daily_candidate_scores
                     {score_where}
                     ORDER BY run_date DESC, rank NULLS LAST, score DESC
@@ -2014,37 +1662,60 @@ def render_topics(
         </section>
         """
 
+    if pane == "library":
+        pane_content = f"""
+        <section class="pane-content">
+          <h2>主题库</h2>
+          {render_topics_table(topic_rows)}
+        </section>
+        """
+    elif pane == "candidates":
+        pane_content = f"""
+        <section class="pane-content">
+          <h2>新闻候选主题</h2>
+          {render_topic_candidates_table(topic_candidate_rows)}
+        </section>
+        """
+    elif pane == "mentions":
+        pane_content = f"""
+        <section class="pane-content">
+          <h2>最近主题提及</h2>
+          {render_topic_mentions_table(mention_rows)}
+        </section>
+        """
+    elif pane == "scores":
+        pane_content = f"""
+        <section class="pane-content">
+          <h2>每日候选评分</h2>
+          {render_candidate_scores_table(score_rows)}
+        </section>
+        """
+    else:
+        pane_content = f"""
+        <section class="metrics">{"".join(metrics)}</section>
+        <section class="split topic-clouds">
+          {render_topic_cloud_panel("主题词云", topic_rows, cloud_type="topics")}
+          {render_topic_cloud_panel("候选主题词云", topic_candidate_rows, cloud_type="candidates")}
+        </section>
+        {migration_hint}
+        """
+
     body = f"""
     <section class="toolbar">
       <h1>主题</h1>
       <form method="get" class="filters">
+        <input type="hidden" name="pane" value="{e(pane)}">
         <input name="topic" value="{e(topic_filter)}" placeholder="topic_slug">
         <input name="ticker" value="{e(ticker_filter)}" placeholder="ticker">
         <select name="candidate_status">
           {render_candidate_status_options(candidate_status_filter)}
         </select>
         <button type="submit">筛选</button>
-        <a class="button primary" href="/tasks">运行自动发现</a>
+        <a class="button primary" href="/tasks?pane=discovery">运行自动发现</a>
       </form>
     </section>
-    <section class="metrics">{"".join(metrics)}</section>
-    {migration_hint}
-    <section>
-      <h2>主题库</h2>
-      {render_topics_table(topic_rows)}
-    </section>
-    <section>
-      <h2>新闻候选主题</h2>
-      {render_topic_candidates_table(topic_candidate_rows)}
-    </section>
-    <section>
-      <h2>最近主题提及</h2>
-      {render_topic_mentions_table(mention_rows)}
-    </section>
-    <section>
-      <h2>每日候选评分</h2>
-      {render_candidate_scores_table(score_rows)}
-    </section>
+    {render_pane_breadcrumbs(path="/topics", query=query, param="pane", panes=TOPIC_PANES, active=pane)}
+    {pane_content}
     """
     return layout("主题", body, active="/topics", query=query)
 
@@ -2056,21 +1727,33 @@ def render_tasks(
 ) -> str:
     today = date.today()
     week_ago = today - timedelta(days=finnhub.DEFAULT_COMPANY_NEWS_DAYS)
+    pane = selected_pane(
+        query,
+        param="pane",
+        panes=TASK_PANES,
+        default="discovery",
+    )
     discovery_status = render_discovery_scheduler_status(
         DISCOVERY_SCHEDULER.snapshot()
     )
+    if pane == "manual":
+        pane_content = render_manual_sync_tools(today=today, week_ago=week_ago)
+    elif pane == "topic-extraction":
+        pane_content = render_topic_extraction_task()
+    else:
+        pane_content = f"""
+        {discovery_status}
+        {render_discovery_task_panel()}
+        """
     body = f"""
     <section class="toolbar">
       <div>
         <h1>同步任务</h1>
-        <p class="page-kicker">主流程放前面，手动补数和排查工具放后面。</p>
+        <p class="page-kicker">主流程、补数工具和主题后处理分区展示。</p>
       </div>
     </section>
-    {discovery_status}
-    {render_discovery_task_panel()}
-    {render_manual_sync_tools(today=today, week_ago=week_ago)}
-    {render_topic_extraction_task()}
-    {render_reddit_sync_hold_card()}
+    {render_pane_breadcrumbs(path="/tasks", query=query, param="pane", panes=TASK_PANES, active=pane)}
+    {pane_content}
     """
     return layout("同步任务", body, active="/tasks", query=query)
 
@@ -2079,12 +1762,11 @@ def render_discovery_task_panel() -> str:
     return f"""
     <section>
       <form class="discovery-panel" method="post" action="/actions/discovery-daily">
-        <input type="hidden" name="skip_reddit_sync" value="1">
         <div class="task-panel-header">
           <div>
             <span class="eyebrow">主流程</span>
             <h2>自动热点发现</h2>
-            <p>同步 Finnhub、GDELT 和 SEC，刷新主题命中与每日候选评分。Reddit 主动拉取暂缓，本页只读取库内已有 Reddit 数据。</p>
+            <p>同步 Finnhub、GDELT 和 SEC，刷新主题命中与每日候选评分。</p>
           </div>
           <div class="button-row action-row">
             <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
@@ -2119,7 +1801,6 @@ def render_discovery_task_panel() -> str:
               <label><input type="checkbox" name="skip_gdelt_sync" value="1"> 跳过 GDELT 主题新闻</label>
               <label><input type="checkbox" name="skip_sec_sync" value="1"> 跳过 SEC filings</label>
             </div>
-            <p class="inline-note">Reddit 主动拉取已暂停，避免当前接入问题影响主流程。</p>
           </div>
         </div>
       </form>
@@ -2201,46 +1882,6 @@ def render_topic_extraction_task() -> str:
     """
 
 
-def render_reddit_sync_hold_card() -> str:
-    settings = get_settings()
-    webhook_state = (
-        "Webhook 密钥已配置"
-        if settings.reddit_devvit_webhook_secret
-        else "Webhook 密钥未配置"
-    )
-    oauth_state = (
-        "旧 OAuth 备用可用"
-        if reddit.has_reddit_oauth_credentials()
-        else "旧 OAuth 备用未启用"
-    )
-    return f"""
-    <section class="task-section">
-      <div class="task-section-header">
-        <div>
-          <h2>Reddit 接入</h2>
-          <p>当前对接暂缓处理，已从本页主动同步任务里拿掉。</p>
-        </div>
-        <span class="badge muted">暂缓</span>
-      </div>
-      <article class="task-card muted-card">
-        <div class="task-card-row">
-          <div>
-            <h2>社区信号排查入口</h2>
-            <p>自动热点发现不会在本页触发 Reddit 备用拉取；需要查看帖子、webhook 或备用同步状态时再进入 Reddit 页面。</p>
-          </div>
-          <div class="button-row">
-            <a class="button" href="/reddit">打开 Reddit 页面</a>
-          </div>
-        </div>
-        <div class="status-line">
-          <span>{e(webhook_state)}</span>
-          <span>{e(oauth_state)}</span>
-        </div>
-      </article>
-    </section>
-    """
-
-
 def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
     active = bool(snapshot.get("active"))
     badge = (
@@ -2306,7 +1947,6 @@ def parse_discovery_run_config(
         include_company_facts=form_bool(form, "include_company_facts"),
         skip_finnhub_sync=form_bool(form, "skip_finnhub_sync"),
         skip_gdelt_sync=form_bool(form, "skip_gdelt_sync"),
-        skip_reddit_sync=form_bool(form, "skip_reddit_sync"),
         skip_sec_sync=form_bool(form, "skip_sec_sync"),
     )
 
@@ -2325,7 +1965,6 @@ def run_discovery_daily(
         include_company_facts=config.include_company_facts,
         skip_finnhub_sync=config.skip_finnhub_sync,
         skip_gdelt_sync=config.skip_gdelt_sync,
-        skip_reddit_sync=config.skip_reddit_sync,
         skip_sec_sync=config.skip_sec_sync,
     )
 
@@ -2543,98 +2182,6 @@ def render_finnhub_articles_table(
     return table(head, "".join(body))
 
 
-def render_reddit_posts_table(
-    rows: list[dict[str, Any]],
-    *,
-    compact: bool = False,
-) -> str:
-    if not rows:
-        return empty_state("暂无 Reddit 帖子。")
-
-    body = []
-    for row in rows:
-        title = e(clip_text(str(row.get("title") or ""), 120))
-        url = row.get("permalink_url")
-        if url:
-            title = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{title}</a>'
-        tickers = format_ticker_list(row.get("candidate_tickers"))
-        metrics = (
-            f"score {fmt(row.get('score'))}"
-            f" / 评论 {fmt(row.get('comment_count'))}"
-        )
-        if compact:
-            body.append(
-                f"""
-                <tr>
-                  <td>{title}<div class="subtle">r/{e(row.get("subreddit"))}</div></td>
-                  <td>{tickers}</td>
-                  <td>{metrics}</td>
-                  <td>{fmt(row.get("created_utc"))}</td>
-                </tr>
-                """
-            )
-        else:
-            body.append(
-                f"""
-                <tr>
-                  <td>{title}<div class="subtle">{e(row.get("link_flair_text"))}</div></td>
-                  <td>r/{e(row.get("subreddit"))}</td>
-                  <td>{tickers}</td>
-                  <td>{format_list(row.get("candidate_keywords"), limit=6)}</td>
-                  <td>{fmt(row.get("score"))}</td>
-                  <td>{fmt(row.get("upvote_ratio"))}</td>
-                  <td>{fmt(row.get("comment_count"))}</td>
-                  <td>{fmt(row.get("created_utc"))}</td>
-                </tr>
-                """
-            )
-
-    if compact:
-        head = "<tr><th>标题</th><th>ticker</th><th>热度</th><th>时间</th></tr>"
-    else:
-        head = (
-            "<tr><th>标题</th><th>社区</th><th>ticker</th><th>关键词</th>"
-            "<th>score</th><th>赞同比</th><th>评论</th><th>时间</th></tr>"
-        )
-    return table(head, "".join(body))
-
-
-def render_reddit_comments_table(rows: list[dict[str, Any]]) -> str:
-    if not rows:
-        return empty_state("暂无 Devvit 实时命中评论。")
-
-    body = []
-    for row in rows:
-        comment = e(clip_text(str(row.get("body") or ""), 160))
-        url = row.get("permalink_url")
-        if url:
-            comment = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{comment}</a>'
-        body.append(
-            f"""
-            <tr>
-              <td>
-                {comment}
-                <div class="subtle">
-                  {e(row.get("author_name"))} / {e(row.get("post_fullname"))}
-                </div>
-              </td>
-              <td>r/{e(row.get("subreddit"))}</td>
-              <td>{format_list(row.get("matched_keywords"), limit=8)}</td>
-              <td>{format_ticker_list(row.get("candidate_tickers"))}</td>
-              <td>{format_list(row.get("candidate_keywords"), limit=6)}</td>
-              <td>{fmt(row.get("score"))}</td>
-              <td>{fmt(row.get("created_utc"))}</td>
-            </tr>
-            """
-        )
-
-    head = (
-        "<tr><th>评论</th><th>社区</th><th>命中词</th><th>ticker</th>"
-        "<th>关键词</th><th>score</th><th>时间</th></tr>"
-    )
-    return table(head, "".join(body))
-
-
 def render_topics_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_state("暂无主题库记录。")
@@ -2698,6 +2245,7 @@ def render_topic_candidates_table(rows: list[dict[str, Any]]) -> str:
     body = []
     for row in rows:
         status = render_topic_candidate_status(row.get("status"))
+        actions = render_topic_candidate_actions(row)
         coverage = (
             f"文章 {fmt(row.get('article_count'))}"
             f"<br>来源 {fmt(row.get('source_count'))}"
@@ -2725,6 +2273,7 @@ def render_topic_candidates_table(rows: list[dict[str, Any]]) -> str:
               <td>{e(matched)}</td>
               <td>{format_topic_candidate_evidence(row.get("evidence"))}</td>
               <td>{fmt(row.get("last_seen_at"))}</td>
+              <td>{actions}</td>
             </tr>
             """
         )
@@ -2732,11 +2281,53 @@ def render_topic_candidates_table(rows: list[dict[str, Any]]) -> str:
         (
             "<tr><th>候选主题</th><th>状态</th><th>分数</th><th>覆盖</th>"
             "<th>GDELT query</th><th>关键词</th><th>相关标的</th>"
-            "<th>来源</th><th>匹配正式主题</th><th>证据</th><th>最近发现</th></tr>"
+            "<th>来源</th><th>匹配正式主题</th><th>证据</th><th>最近发现</th>"
+            "<th>操作</th></tr>"
         ),
         "".join(body),
     )
 
+
+def render_topic_candidate_actions(row: dict[str, Any]) -> str:
+    status = str(row.get("status") or "pending")
+    matched = row.get("matched_topic_slug")
+    slug = str(row.get("candidate_slug") or "").strip()
+    if status != "pending":
+        return '<span class="subtle">-</span>'
+    if not slug:
+        return '<span class="subtle">缺少 slug</span>'
+
+    promote_action = (
+        '<span class="subtle">已匹配正式主题</span>'
+        if matched
+        else f"""
+        <form method="post" action="/actions/topic-promote" class="inline-action-form">
+          <input type="hidden" name="candidate_slug" value="{e(slug)}">
+          <label class="compact-checkbox">
+            <input type="checkbox" name="activate" value="1">
+            启用
+          </label>
+          <button
+            class="secondary"
+            type="submit"
+            onclick="return confirm('确认晋升这个候选主题为正式主题？')"
+          >晋升</button>
+        </form>
+        """
+    )
+    return f"""
+    <div class="inline-action-stack">
+      {promote_action}
+      <form method="post" action="/actions/topic-ignore" class="inline-action-form compact-action-form">
+        <input type="hidden" name="candidate_slug" value="{e(slug)}">
+        <button
+          class="secondary"
+          type="submit"
+          onclick="return confirm('确认忽略这个候选主题？')"
+        >忽略</button>
+      </form>
+    </div>
+    """
 
 def render_topic_candidate_status(status: Any) -> str:
     text = str(status or "pending")
@@ -2819,7 +2410,6 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
               <td>{format_list(row.get("topic_slugs"), limit=5)}</td>
               <td>{fmt(row.get("finnhub_article_count"))}</td>
               <td>{fmt(row.get("gdelt_article_count"))}</td>
-              <td>{fmt(row.get("reddit_post_count"))}</td>
               <td>{fmt(row.get("sec_filing_count"))}</td>
             </tr>
             """
@@ -2828,7 +2418,7 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
         (
             "<tr><th>日期</th><th>排名</th><th>ticker</th><th>评分</th>"
             "<th>动作</th><th>主主题</th><th>主题</th>"
-            "<th>Finnhub</th><th>GDELT</th><th>Reddit</th><th>SEC</th></tr>"
+            "<th>Finnhub</th><th>GDELT</th><th>SEC</th></tr>"
         ),
         "".join(body),
     )
@@ -2862,6 +2452,314 @@ def format_list(value: Any, *, limit: int = 8) -> str:
     return e(", ".join(clipped) + suffix)
 
 
+def render_topic_cloud_panel(
+    title: str,
+    rows: list[dict[str, Any]],
+    *,
+    cloud_type: str,
+) -> str:
+    terms = build_topic_cloud_terms(rows, cloud_type=cloud_type)
+    if not terms:
+        content = empty_state("暂无可生成词云的数据。")
+        count = "0"
+    else:
+        content = render_topic_cloud_svg(terms, title=title, cloud_id=cloud_type)
+        count = str(len(terms))
+
+    return f"""
+    <div class="topic-cloud-panel">
+      <div class="topic-cloud-heading">
+        <h2>{e(title)}</h2>
+        <span>{e(count)} 词</span>
+      </div>
+      {content}
+    </div>
+    """
+
+
+def build_topic_cloud_terms(
+    rows: list[dict[str, Any]],
+    *,
+    cloud_type: str,
+) -> list[tuple[str, float]]:
+    weights: dict[str, float] = {}
+    labels: dict[str, str] = {}
+
+    def add_term(value: Any, weight: float) -> None:
+        label = normalize_cloud_text(value)
+        if not label:
+            return
+        key = label.casefold()
+        weights[key] = weights.get(key, 0.0) + max(weight, 0.35)
+        labels.setdefault(key, label)
+
+    for row in rows:
+        if cloud_type == "candidates":
+            base = (
+                6.0
+                + numeric_value(row.get("trend_score")) * 1.15
+                + numeric_value(row.get("article_count")) * 1.25
+                + numeric_value(row.get("source_count")) * 1.6
+                + numeric_value(row.get("ticker_count")) * 1.25
+            )
+            label = row.get("topic_name") or row.get("candidate_slug")
+            add_term(label, base + 5.0)
+            add_term(str(row.get("candidate_slug") or "").replace("_", " "), base * 0.45)
+        else:
+            active_bonus = 2.0 if row.get("is_active") else 0.0
+            base = (
+                5.0
+                + active_bonus
+                + numeric_value(row.get("recent_mentions")) * 2.4
+                + numeric_value(row.get("mention_count")) * 0.4
+                + numeric_value(row.get("ticker_count")) * 1.2
+            )
+            priority = numeric_value(row.get("priority"))
+            if priority > 0:
+                base += max(0.0, 6.0 - min(priority, 6.0))
+            label = row.get("topic_name") or row.get("topic_slug")
+            add_term(label, base + 5.0)
+            add_term(str(row.get("topic_slug") or "").replace("_", " "), base * 0.4)
+
+        for keyword in cloud_list_items(row.get("keywords"))[:12]:
+            add_term(keyword, base * 0.5 + 1.0)
+        for ticker in cloud_list_items(row.get("ticker_hints"))[:8]:
+            add_term(str(ticker).upper(), base * 0.22 + 0.75)
+
+    terms = sorted(
+        ((labels[key], weight) for key, weight in weights.items()),
+        key=lambda item: (-item[1], item[0].casefold()),
+    )
+    return terms[:TOPIC_CLOUD_MAX_TERMS]
+
+
+def render_topic_cloud_svg(
+    terms: list[tuple[str, float]],
+    *,
+    title: str,
+    cloud_id: str,
+) -> str:
+    placed = layout_topic_cloud_terms(terms)
+    if not placed:
+        return empty_state("暂无可生成词云的数据。")
+
+    title_id = f"topic-cloud-title-{cloud_id}"
+    clip_id = f"topic-cloud-clip-{cloud_id}"
+    words = []
+    for index, item in enumerate(placed):
+        color = TOPIC_CLOUD_PALETTE[index % len(TOPIC_CLOUD_PALETTE)]
+        words.append(
+            f"""
+            <text
+              class="topic-cloud-word"
+              x="{item['x']:.1f}"
+              y="{item['y']:.1f}"
+              font-size="{item['font_size']:.1f}"
+              fill="{color}"
+            >{e(item["text"])}</text>
+            """
+        )
+
+    return f"""
+    <figure class="topic-cloud-figure">
+      <svg class="topic-cloud-svg" viewBox="0 0 {TOPIC_CLOUD_SIZE} {TOPIC_CLOUD_SIZE}" role="img" aria-labelledby="{title_id}">
+        <title id="{title_id}">{e(title)}</title>
+        <defs>
+          <clipPath id="{clip_id}">
+            <circle cx="{TOPIC_CLOUD_SIZE / 2:.0f}" cy="{TOPIC_CLOUD_SIZE / 2:.0f}" r="{TOPIC_CLOUD_RADIUS}" />
+          </clipPath>
+        </defs>
+        <circle class="topic-cloud-bg" cx="{TOPIC_CLOUD_SIZE / 2:.0f}" cy="{TOPIC_CLOUD_SIZE / 2:.0f}" r="{TOPIC_CLOUD_RADIUS}" />
+        <g clip-path="url(#{clip_id})">
+          {"".join(words)}
+        </g>
+      </svg>
+    </figure>
+    """
+
+
+def layout_topic_cloud_terms(terms: list[tuple[str, float]]) -> list[dict[str, Any]]:
+    if not terms:
+        return []
+
+    weights = [weight for _, weight in terms]
+    min_weight = min(weights)
+    max_weight = max(weights)
+    span = max(max_weight - min_weight, 1.0)
+    center = TOPIC_CLOUD_SIZE / 2
+    placed: list[dict[str, Any]] = []
+    boxes: list[tuple[float, float, float, float]] = []
+
+    for index, (text, weight) in enumerate(terms):
+        emphasis = math.sqrt(max(weight - min_weight, 0.0) / span)
+        font_size = 12.0 + emphasis * 25.0
+        if index == 0:
+            font_size = max(font_size, 32.0)
+        text_units = estimate_cloud_text_units(text)
+        font_size = min(font_size, max(12.0, 330.0 / max(text_units, 1.0)))
+
+        item = place_cloud_word(text, font_size, index, center, boxes)
+        if item is None:
+            item = place_cloud_word(text, max(11.0, font_size - 5.0), index, center, boxes)
+        if item is None:
+            continue
+
+        placed.append(item)
+        boxes.append(item["box"])
+
+    return center_topic_cloud_terms(placed, center)
+
+
+def center_topic_cloud_terms(
+    placed: list[dict[str, Any]],
+    center: float,
+) -> list[dict[str, Any]]:
+    if not placed:
+        return placed
+
+    total_weight = sum(item["font_size"] ** 1.4 for item in placed)
+    visual_x = sum(item["x"] * item["font_size"] ** 1.4 for item in placed) / total_weight
+    visual_y = sum(item["y"] * item["font_size"] ** 1.4 for item in placed) / total_weight
+    min_x = min(item["box"][0] for item in placed)
+    min_y = min(item["box"][1] for item in placed)
+    max_x = max(item["box"][2] for item in placed)
+    max_y = max(item["box"][3] for item in placed)
+    bounds_x = (min_x + max_x) / 2
+    bounds_y = (min_y + max_y) / 2
+    target_x = visual_x * 0.68 + bounds_x * 0.32
+    target_y = visual_y * 0.68 + bounds_y * 0.32
+    dx = max(-48.0, min(48.0, center - target_x))
+    dy = max(-48.0, min(48.0, center - target_y))
+    if abs(dx) < 0.5 and abs(dy) < 0.5:
+        return placed
+
+    for factor in (1.0, 0.75, 0.5, 0.25):
+        shift_x = dx * factor
+        shift_y = dy * factor
+        shifted_boxes = [
+            (
+                item["box"][0] + shift_x,
+                item["box"][1] + shift_y,
+                item["box"][2] + shift_x,
+                item["box"][3] + shift_y,
+            )
+            for item in placed
+        ]
+        if all(box_inside_cloud(box, center) for box in shifted_boxes):
+            for item, box in zip(placed, shifted_boxes, strict=True):
+                item["x"] += shift_x
+                item["y"] += shift_y
+                item["box"] = box
+            break
+
+    return placed
+
+
+def place_cloud_word(
+    text: str,
+    font_size: float,
+    index: int,
+    center: float,
+    boxes: list[tuple[float, float, float, float]],
+) -> dict[str, Any] | None:
+    width = estimate_cloud_text_units(text) * font_size
+    height = font_size * 1.08
+    half_width = width / 2
+    half_height = height / 2
+    half_diagonal = math.sqrt(half_width * half_width + half_height * half_height)
+    max_distance = TOPIC_CLOUD_RADIUS - half_diagonal - 5
+    if max_distance <= 0:
+        return None
+
+    start_step = 0 if index == 0 else index * 4
+    for step in range(start_step, start_step + 720):
+        angle = step * 2.399963229728653 + index * 0.43
+        distance = min(max_distance, 4.2 * math.sqrt(step))
+        x = center + math.cos(angle) * distance
+        y = center + math.sin(angle) * distance
+        box = (x - half_width - 3, y - half_height - 3, x + half_width + 3, y + half_height + 3)
+        if not box_inside_cloud(box, center):
+            continue
+        if any(boxes_overlap(box, existing) for existing in boxes):
+            continue
+        return {
+            "text": text,
+            "font_size": font_size,
+            "x": x,
+            "y": y,
+            "box": box,
+        }
+    return None
+
+
+def box_inside_cloud(box: tuple[float, float, float, float], center: float) -> bool:
+    for x, y in (
+        (box[0], box[1]),
+        (box[0], box[3]),
+        (box[2], box[1]),
+        (box[2], box[3]),
+    ):
+        if math.hypot(x - center, y - center) > TOPIC_CLOUD_RADIUS - 3:
+            return False
+    return True
+
+
+def boxes_overlap(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> bool:
+    return not (
+        first[2] < second[0]
+        or first[0] > second[2]
+        or first[3] < second[1]
+        or first[1] > second[3]
+    )
+
+
+def estimate_cloud_text_units(text: str) -> float:
+    units = 0.0
+    for char in text:
+        if char.isspace():
+            units += 0.34
+        elif ord(char) < 128:
+            units += 0.58
+        else:
+            units += 0.96
+    return max(units, 1.0)
+
+
+def normalize_cloud_text(value: Any) -> str:
+    text = " ".join(str(value or "").replace("_", " ").split())
+    if not text or text == "-":
+        return ""
+    if len(text) > TOPIC_CLOUD_TEXT_LIMIT:
+        text = clip_text(text, TOPIC_CLOUD_TEXT_LIMIT)
+    return text
+
+
+def cloud_list_items(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, list | tuple):
+        raw_items = value
+    else:
+        raw_items = []
+    return [str(item).strip() for item in raw_items if str(item).strip()]
+
+
+def numeric_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
 def render_finnhub_breakdown_table(
     rows: list[dict[str, Any]],
     *,
@@ -2883,31 +2781,6 @@ def render_finnhub_breakdown_table(
         )
     return table(
         "<tr><th>名称</th><th>数量</th><th>最近发布时间</th></tr>",
-        "".join(body),
-    )
-
-
-def render_reddit_breakdown_table(
-    rows: list[dict[str, Any]],
-    *,
-    empty_message: str,
-) -> str:
-    if not rows:
-        return empty_state(empty_message)
-
-    body = []
-    for row in rows:
-        body.append(
-            f"""
-            <tr>
-              <td>{e(row.get("label"))}</td>
-              <td>{fmt(row.get("total"))}</td>
-              <td>{fmt(row.get("latest_at"))}</td>
-            </tr>
-            """
-        )
-    return table(
-        "<tr><th>名称</th><th>数量</th><th>最近帖子</th></tr>",
         "".join(body),
     )
 
@@ -2964,33 +2837,6 @@ def render_finnhub_queries_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def render_reddit_queries_table(rows: list[dict[str, Any]]) -> str:
-    if not rows:
-        return empty_state("暂无 Reddit 查询记录。")
-
-    body = []
-    for row in rows:
-        body.append(
-            f"""
-            <tr>
-              <td>r/{e(row.get("subreddit"))}</td>
-              <td>{e(row.get("listing"))}</td>
-              <td>{e(row.get("time_filter"))}</td>
-              <td>{fmt(row.get("limit_count"))}</td>
-              <td>{e(row.get("after_token"))}</td>
-              <td>{fmt(row.get("fetched_at"))}</td>
-            </tr>
-            """
-        )
-    return table(
-        (
-            "<tr><th>subreddit</th><th>listing</th><th>时间窗口</th>"
-            "<th>数量</th><th>after</th><th>抓取时间</th></tr>"
-        ),
-        "".join(body),
-    )
-
-
 def render_migrations_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_state("暂无迁移记录。")
@@ -3010,11 +2856,20 @@ def render_migrations_table(rows: list[dict[str, Any]]) -> str:
     return table("<tr><th>版本</th><th>名称</th><th>执行时间</th><th>耗时</th></tr>", "".join(body))
 
 
-def table(head: str, body: str) -> str:
+def table(head: str, body: str, *, page_size: int = TABLE_PAGE_SIZE) -> str:
     return (
-        '<div class="table-panel"><div class="table-wrap">'
+        '<div class="table-panel" data-table-panel '
+        f'data-page-size="{page_size}"><div class="table-wrap">'
         f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
-        "</div></div>"
+        "</div>"
+        '<div class="table-pagination" data-pagination hidden>'
+        '<span class="table-page-info" data-page-info></span>'
+        '<div class="table-page-actions">'
+        '<button type="button" data-page-prev aria-label="上一页">上一页</button>'
+        '<button type="button" data-page-next aria-label="下一页">下一页</button>'
+        "</div>"
+        "</div>"
+        "</div>"
     )
 
 
@@ -3080,7 +2935,6 @@ def layout(
         ("/sec", "SEC", "公告与事实"),
         ("/gdelt", "GDELT", "全球新闻"),
         ("/finnhub", "Finnhub", "金融新闻"),
-        ("/reddit", "Reddit", "社区情绪"),
         ("/topics", "主题", "热点与评分"),
         ("/tasks", "同步", "数据任务"),
     ]
@@ -3107,6 +2961,94 @@ def layout(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{e(title)} · USStock</title>
   <link rel="stylesheet" href="{PICO_CSS_URL}">
+  <script>
+    window.usstockPanelTheme = {{
+      key: "usstock-panel-light",
+      read() {{
+        try {{
+          return localStorage.getItem(this.key) !== "off";
+        }} catch (error) {{
+          return true;
+        }}
+      }},
+      write(value) {{
+        try {{
+          localStorage.setItem(this.key, value ? "on" : "off");
+        }} catch (error) {{
+          // Keep the visual state even when storage is unavailable.
+        }}
+        document.documentElement.dataset.lightMode = value ? "on" : "off";
+      }},
+    }};
+    document.documentElement.dataset.lightMode = window.usstockPanelTheme.read() ? "on" : "off";
+  </script>
+  <script>
+    window.usstockTablePager = {{
+      init(root) {{
+        const scope = root || document;
+        const panels = [];
+        if (scope.matches && scope.matches("[data-table-panel]")) {{
+          panels.push(scope);
+        }}
+        if (scope.querySelectorAll) {{
+          panels.push(...scope.querySelectorAll("[data-table-panel]"));
+        }}
+
+        panels.forEach((panel) => {{
+          if (panel.dataset.tablePagerReady === "1") {{
+            return;
+          }}
+          panel.dataset.tablePagerReady = "1";
+
+          const rows = Array.from(panel.querySelectorAll("tbody tr"));
+          const controls = panel.querySelector("[data-pagination]");
+          const info = panel.querySelector("[data-page-info]");
+          const prev = panel.querySelector("[data-page-prev]");
+          const next = panel.querySelector("[data-page-next]");
+          if (!controls || !info || !prev || !next || rows.length === 0) {{
+            return;
+          }}
+
+          const parsedPageSize = Number.parseInt(panel.dataset.pageSize || "{TABLE_PAGE_SIZE}", 10);
+          const pageSize = Number.isFinite(parsedPageSize) && parsedPageSize > 0
+            ? parsedPageSize
+            : {TABLE_PAGE_SIZE};
+          let page = 1;
+
+          const render = () => {{
+            const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+            page = Math.min(Math.max(page, 1), totalPages);
+            const start = (page - 1) * pageSize;
+            const end = start + pageSize;
+            rows.forEach((row, index) => {{
+              row.hidden = index < start || index >= end;
+            }});
+            controls.hidden = rows.length <= pageSize;
+            info.textContent = "第 " + page + " / " + totalPages + " 页 · 共 " + rows.length + " 条";
+            prev.disabled = page <= 1;
+            next.disabled = page >= totalPages;
+          }};
+
+          prev.addEventListener("click", () => {{
+            page -= 1;
+            render();
+          }});
+          next.addEventListener("click", () => {{
+            page += 1;
+            render();
+          }});
+          render();
+        }});
+      }},
+    }};
+
+    document.addEventListener("DOMContentLoaded", () => {{
+      window.usstockTablePager.init(document);
+    }});
+    document.addEventListener("htmx:afterSettle", (event) => {{
+      window.usstockTablePager.init(event.target || document);
+    }});
+  </script>
   <script src="{HTMX_JS_URL}" defer></script>
   <script src="{ALPINE_JS_URL}" defer></script>
   <style>
@@ -3125,18 +3067,43 @@ def layout(
       --line-strong: #c8d0cb;
       --nav: #171b19;
       --nav-soft: #212722;
+      --topbar-bg: rgba(246, 247, 248, 0.92);
+      --input-bg: #ffffff;
+      --button-bg: #ffffff;
+      --button-hover: #f8faf9;
+      --disabled-bg: #eef1ef;
+      --table-row-line: #edf0ed;
+      --brand-mark-bg: #dfeee8;
+      --brand-mark-color: #13795b;
       --primary: #13795b;
       --primary-hover: #0f6049;
       --accent: #a15c10;
       --ok: #237847;
       --watch: #996600;
       --error: #b3261e;
+      --badge-muted-bg: #edf2ef;
+      --badge-ok-bg: #e4f4ea;
+      --badge-watch-bg: #fff2cc;
+      --notice-ok-bg: #f1faf4;
+      --notice-error-bg: #fff5f4;
+      --light-toggle-bg: #fff8df;
+      --light-toggle-border: #e8c969;
+      --light-toggle-glow: rgba(255, 199, 44, 0.5);
       --shadow: 0 18px 50px rgba(31, 37, 35, 0.08);
+    }}
+    html[data-light-mode="off"] {{
+      color-scheme: dark;
+    }}
+    html[data-light-mode="off"] body {{
+      background: #0f1512;
     }}
     * {{
       box-sizing: border-box;
     }}
     [x-cloak] {{
+      display: none !important;
+    }}
+    [hidden] {{
       display: none !important;
     }}
     body {{
@@ -3159,6 +3126,44 @@ def layout(
       min-height: 100vh;
       display: grid;
       grid-template-columns: 248px minmax(0, 1fr);
+      background: var(--bg);
+      transition: background-color 200ms ease, color 200ms ease;
+    }}
+    .app-shell.lights-off,
+    html[data-light-mode="off"] .app-shell {{
+      color-scheme: dark;
+      --bg: #0f1512;
+      --surface: #171f1b;
+      --surface-soft: #111814;
+      --ink: #e8f0ec;
+      --muted: #a3b2ab;
+      --line: #2b3731;
+      --line-strong: #3a4942;
+      --nav: #070b09;
+      --nav-soft: #132019;
+      --topbar-bg: rgba(15, 21, 18, 0.9);
+      --input-bg: #111814;
+      --button-bg: #19231e;
+      --button-hover: #213027;
+      --disabled-bg: #1d2722;
+      --table-row-line: #25312c;
+      --brand-mark-bg: #f4c842;
+      --brand-mark-color: #121712;
+      --primary: #63d3a5;
+      --primary-hover: #8ae8c5;
+      --accent: #e2a64b;
+      --ok: #73d89d;
+      --watch: #f0c462;
+      --error: #ff9a91;
+      --badge-muted-bg: #22302a;
+      --badge-ok-bg: #143524;
+      --badge-watch-bg: #3a2d13;
+      --notice-ok-bg: #10291c;
+      --notice-error-bg: #321817;
+      --light-toggle-bg: #151d19;
+      --light-toggle-border: #34433c;
+      --light-toggle-glow: rgba(99, 211, 165, 0);
+      --shadow: 0 18px 54px rgba(0, 0, 0, 0.26);
     }}
     .sidebar {{
       position: sticky;
@@ -3184,9 +3189,14 @@ def layout(
       width: 36px;
       height: 36px;
       border-radius: 8px;
-      background: #dfeee8;
-      color: var(--primary);
+      background: var(--brand-mark-bg);
+      color: var(--brand-mark-color);
       font-weight: 800;
+      box-shadow: 0 0 0 rgba(255, 208, 72, 0);
+      transition: background-color 180ms ease, color 180ms ease, box-shadow 180ms ease;
+    }}
+    .app-shell.lights-on .brand-mark {{
+      box-shadow: 0 0 22px rgba(244, 200, 66, 0.32);
     }}
     .brand-title {{
       display: grid;
@@ -3260,6 +3270,43 @@ def layout(
       font-size: 12px;
       line-height: 1.55;
     }}
+    .pane-breadcrumbs {{
+      display: flex;
+      align-items: center;
+      gap: 0;
+      min-width: 0;
+      overflow-x: auto;
+      scrollbar-width: thin;
+    }}
+    .pane-crumb {{
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      min-height: 34px;
+      padding: 0 9px;
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+      transition: background 140ms ease, color 140ms ease;
+    }}
+    .pane-crumb + .pane-crumb::before {{
+      content: "/";
+      margin-right: 9px;
+      color: var(--line-strong);
+      font-weight: 500;
+    }}
+    .pane-crumb:hover, .pane-crumb.active {{
+      background: var(--surface-soft);
+      color: var(--primary);
+    }}
+    .pane-breadcrumbs {{
+      margin-top: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }}
     .content-shell {{
       min-width: 0;
     }}
@@ -3274,7 +3321,7 @@ def layout(
       min-height: 64px;
       padding: 0 28px;
       border-bottom: 1px solid var(--line);
-      background: rgba(246, 247, 248, 0.92);
+      background: var(--topbar-bg);
       backdrop-filter: blur(12px);
     }}
     .topbar-title {{
@@ -3297,6 +3344,61 @@ def layout(
       display: flex;
       align-items: center;
       gap: 10px;
+      flex: 0 0 auto;
+    }}
+    button.light-toggle {{
+      gap: 8px;
+      min-width: 82px;
+      border-color: var(--light-toggle-border);
+      background: var(--light-toggle-bg);
+      box-shadow: 0 0 18px var(--light-toggle-glow);
+    }}
+    button.light-toggle:hover {{
+      border-color: var(--light-toggle-border);
+      background: var(--light-toggle-bg);
+    }}
+    .light-bulb {{
+      position: relative;
+      width: 15px;
+      height: 15px;
+      border-radius: 50% 50% 45% 45%;
+      background: #ffd45a;
+      box-shadow: 0 0 14px rgba(255, 207, 65, 0.76);
+      transition: background-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+    }}
+    .light-bulb::before {{
+      content: "";
+      position: absolute;
+      left: 4px;
+      right: 4px;
+      bottom: -5px;
+      height: 6px;
+      border-radius: 2px;
+      background: #9b7a22;
+    }}
+    .light-bulb::after {{
+      content: "";
+      position: absolute;
+      top: 3px;
+      right: 3px;
+      width: 4px;
+      height: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.86);
+    }}
+    .app-shell.lights-off .light-bulb,
+    html[data-light-mode="off"] .app-shell .light-bulb {{
+      background: #59675f;
+      box-shadow: none;
+      transform: translateY(1px);
+    }}
+    .app-shell.lights-off .light-bulb::before,
+    html[data-light-mode="off"] .app-shell .light-bulb::before {{
+      background: #36413b;
+    }}
+    .app-shell.lights-off .light-bulb::after,
+    html[data-light-mode="off"] .app-shell .light-bulb::after {{
+      opacity: 0.28;
     }}
     button.nav-toggle {{
       display: none;
@@ -3322,8 +3424,9 @@ def layout(
       background: currentColor;
     }}
     main.content {{
-      width: min(1260px, calc(100vw - 312px));
-      margin: 0 auto;
+      width: 100%;
+      min-height: calc(100vh - 64px);
+      margin: 0;
       padding: 26px 28px 64px;
     }}
     section {{
@@ -3386,6 +3489,7 @@ def layout(
       border-radius: 8px;
       background: var(--surface);
       box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
+      transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
     }}
     .metric-label, .metric-hint, .subtle {{
       color: var(--muted);
@@ -3417,6 +3521,63 @@ def layout(
       border-radius: 8px;
       background: var(--surface);
       min-width: 0;
+      transition: background-color 180ms ease, border-color 180ms ease;
+    }}
+    .topic-clouds {{
+      align-items: stretch;
+    }}
+    .topic-cloud-panel {{
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 12px;
+    }}
+    .topic-cloud-heading {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .topic-cloud-heading h2 {{
+      margin: 0;
+    }}
+    .topic-cloud-heading span {{
+      display: inline-flex;
+      align-items: center;
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .topic-cloud-figure {{
+      display: grid;
+      place-items: center;
+      min-height: 348px;
+      margin: 0;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      transition: background-color 180ms ease, border-color 180ms ease;
+    }}
+    .topic-cloud-svg {{
+      display: block;
+      width: min(100%, 420px);
+      height: auto;
+    }}
+    .topic-cloud-bg {{
+      fill: var(--surface-soft);
+      stroke: var(--line);
+      stroke-width: 1.2;
+    }}
+    .topic-cloud-word {{
+      font-family: var(--pico-font-family-sans-serif);
+      font-weight: 760;
+      text-anchor: middle;
+      dominant-baseline: middle;
     }}
     .task-grid {{
       display: grid;
@@ -3435,6 +3596,7 @@ def layout(
       border-radius: 8px;
       background: var(--surface);
       box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
+      transition: background-color 180ms ease, border-color 180ms ease;
     }}
     .task-section-header {{
       display: flex;
@@ -3455,6 +3617,7 @@ def layout(
       border-radius: 8px;
       background: var(--surface);
       box-shadow: 0 1px 0 rgba(31, 37, 35, 0.02);
+      transition: background-color 180ms ease, border-color 180ms ease;
     }}
     .task-panel-header {{
       display: flex;
@@ -3524,7 +3687,7 @@ def layout(
       border: 1px solid var(--line);
       border-radius: 999px;
       color: var(--muted);
-      background: #ffffff;
+      background: var(--surface);
       font-size: 12px;
       font-weight: 650;
     }}
@@ -3533,6 +3696,40 @@ def layout(
       gap: 10px;
       flex-wrap: wrap;
     }}
+    .inline-action-stack {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      min-width: 196px;
+    }}
+    .inline-action-form {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+      min-width: 132px;
+    }}
+    .inline-action-form.compact-action-form {{
+      min-width: 0;
+    }}
+    .inline-action-form button {{
+      margin: 0;
+      padding: 7px 10px;
+      white-space: nowrap;
+    }}
+    .compact-checkbox {{
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      margin: 0;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .compact-checkbox input {{
+      margin: 0;
+    }}
     .action-row {{
       justify-content: flex-end;
       min-width: 286px;
@@ -3540,9 +3737,31 @@ def layout(
     .filters {{
       display: flex;
       align-items: center;
+      justify-content: flex-end;
       gap: 10px;
-      flex-wrap: wrap;
+      flex: 1 1 620px;
+      flex-wrap: nowrap;
+      min-width: 0;
       margin: 0;
+    }}
+    .filters input:not([type="checkbox"]), .filters select {{
+      flex: 1 1 150px;
+      width: auto;
+      min-width: 128px;
+      max-width: 190px;
+      margin: 0;
+    }}
+    .filters select {{
+      max-width: 220px;
+    }}
+    .filters button, .filters .button {{
+      flex: 0 0 auto;
+      width: auto;
+      min-width: 0;
+      margin: 0;
+    }}
+    .filters label {{
+      flex: 0 0 auto;
     }}
     .grid-form {{
       display: grid;
@@ -3554,6 +3773,7 @@ def layout(
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface);
+      transition: background-color 180ms ease, border-color 180ms ease;
     }}
     .span-2 {{
       grid-column: 1 / -1;
@@ -3566,21 +3786,22 @@ def layout(
       font-size: 13px;
       font-weight: 600;
     }}
-    input:not([type="checkbox"]), textarea {{
+    input:not([type="checkbox"]), textarea, select {{
       width: 100%;
       min-height: 38px;
       padding: 8px 10px;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
-      background: #ffffff;
+      background: var(--input-bg);
       color: var(--ink);
       font: inherit;
       font-size: 14px;
+      transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease;
     }}
     textarea {{
       resize: vertical;
     }}
-    input:not([type="checkbox"]) {{
+    input:not([type="checkbox"]), select {{
       height: 42px;
     }}
     label:has(input[type="checkbox"]) {{
@@ -3600,11 +3821,13 @@ def layout(
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      width: auto;
+      max-width: 100%;
       min-height: 38px;
       padding: 0 13px;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
-      background: #ffffff;
+      background: var(--button-bg);
       color: var(--ink);
       font: inherit;
       font-size: 14px;
@@ -3617,7 +3840,7 @@ def layout(
     }}
     button:hover, [type="submit"]:hover, [type="button"]:hover, .button:hover {{
       border-color: #aeb8b2;
-      background: #f8faf9;
+      background: var(--button-hover);
       text-decoration: none;
     }}
     button.primary, .button.primary {{
@@ -3631,7 +3854,7 @@ def layout(
     }}
     button:disabled, button:disabled:hover {{
       border-color: var(--line-strong);
-      background: #eef1ef;
+      background: var(--disabled-bg);
       color: var(--muted);
       cursor: not-allowed;
       opacity: 0.78;
@@ -3644,9 +3867,45 @@ def layout(
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface);
+      transition: background-color 180ms ease, border-color 180ms ease;
+    }}
+    .pane-content .table-panel {{
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: calc(100vh - 278px);
+      min-height: 520px;
     }}
     .table-wrap {{
       overflow-x: auto;
+    }}
+    .pane-content .table-wrap {{
+      flex: 1 1 auto;
+      overflow: auto;
+    }}
+    .table-pagination {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: var(--surface-soft);
+    }}
+    .table-page-info {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }}
+    .table-page-actions {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .table-pagination button {{
+      min-height: 32px;
+      padding: 0 10px;
+      font-size: 12px;
     }}
     table {{
       width: 100%;
@@ -3654,10 +3913,14 @@ def layout(
       min-width: 720px;
       margin: 0;
       font-size: 13px;
+      color: var(--ink);
+    }}
+    .pane-content table {{
+      min-width: max(100%, 1480px);
     }}
     th, td {{
       padding: 10px 11px;
-      border-bottom: 1px solid #edf0ed;
+      border-bottom: 1px solid var(--table-row-line);
       text-align: left;
       vertical-align: top;
     }}
@@ -3665,10 +3928,14 @@ def layout(
       border-bottom: 0;
     }}
     th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
       background: var(--surface-soft);
+      white-space: nowrap;
     }}
     .badge {{
       display: inline-flex;
@@ -3676,22 +3943,22 @@ def layout(
       height: 22px;
       padding: 0 8px;
       border-radius: 999px;
-      background: #edf2ef;
+      background: var(--badge-muted-bg);
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
       white-space: nowrap;
     }}
     .badge.ok {{
-      background: #e4f4ea;
+      background: var(--badge-ok-bg);
       color: var(--ok);
     }}
     .badge.watch {{
-      background: #fff2cc;
+      background: var(--badge-watch-bg);
       color: var(--watch);
     }}
     .badge.muted {{
-      background: #edf2ef;
+      background: var(--badge-muted-bg);
       color: var(--muted);
     }}
     .empty {{
@@ -3717,12 +3984,12 @@ def layout(
     .notice.ok {{
       border-color: #b8dfc5;
       color: var(--ok);
-      background: #f1faf4;
+      background: var(--notice-ok-bg);
     }}
     .notice.error {{
       border-color: #edb8b4;
       color: var(--error);
-      background: #fff5f4;
+      background: var(--notice-error-bg);
     }}
     .notice-close {{
       width: 28px;
@@ -3741,6 +4008,7 @@ def layout(
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface);
+      transition: background-color 180ms ease, border-color 180ms ease;
     }}
     .error-text {{
       color: var(--error);
@@ -3832,16 +4100,25 @@ def layout(
       .split > div, .task-grid form, .task-card, .status-panel, .discovery-panel {{
         padding: 14px;
       }}
+      .topic-cloud-figure {{
+        min-height: 286px;
+      }}
       .grid-form {{
         padding: 14px;
       }}
       .filters {{
         width: 100%;
         align-items: stretch;
+        flex-direction: column;
+        flex-wrap: nowrap;
+        justify-content: flex-start;
       }}
-      .filters input, .filters select, .filters button, .filters .button {{
+      .filters input:not([type="checkbox"]), .filters select,
+      .filters button, .filters .button {{
+        flex: 0 0 auto;
         width: 100%;
         min-width: 100%;
+        max-width: none;
       }}
       .topbar-actions .button {{
         display: none;
@@ -3864,7 +4141,15 @@ def layout(
   <div
     id="app"
     class="app-shell"
-    x-data="{{navOpen: false}}"
+    x-data="{{
+      navOpen: false,
+      lightsOn: window.usstockPanelTheme.read(),
+      toggleLights() {{
+        this.lightsOn = !this.lightsOn;
+        window.usstockPanelTheme.write(this.lightsOn);
+      }}
+    }}"
+    :class="{{'lights-off': !lightsOn, 'lights-on': lightsOn}}"
     hx-boost="true"
     hx-target="#app"
     hx-select="#app"
@@ -3904,6 +4189,16 @@ def layout(
           <strong>{e(title)}</strong>
         </div>
         <div class="topbar-actions">
+          <button
+            class="light-toggle"
+            type="button"
+            :aria-label="lightsOn ? '关灯' : '开灯'"
+            :title="lightsOn ? '关灯' : '开灯'"
+            @click="toggleLights()"
+          >
+            <span class="light-bulb" aria-hidden="true"></span>
+            <span x-text="lightsOn ? '关灯' : '开灯'">关灯</span>
+          </button>
           <a class="button ghost" href="/tasks">同步任务</a>
         </div>
       </header>
