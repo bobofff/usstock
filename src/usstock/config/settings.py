@@ -62,6 +62,10 @@ class Settings:
     finnhub_base_url: str
     finnhub_rate_limit_per_second: float
     finnhub_request_timeout_seconds: float
+    llm_api_key: str | None
+    llm_base_url: str
+    llm_model: str | None
+    llm_request_timeout_seconds: float
 
 
 @lru_cache(maxsize=1)
@@ -135,6 +139,38 @@ def get_settings() -> Settings:
         or env_file_values.get("FINNHUB_REQUEST_TIMEOUT_SECONDS")
         or "30"
     )
+    llm_api_key = (
+        os.environ.get("REPORT_LLM_API_KEY")
+        or env_file_values.get("REPORT_LLM_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+        or env_file_values.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or env_file_values.get("OPENAI_API_KEY")
+    )
+    llm_base_url = (
+        os.environ.get("REPORT_LLM_BASE_URL")
+        or env_file_values.get("REPORT_LLM_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or env_file_values.get("LLM_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or env_file_values.get("OPENAI_BASE_URL")
+        or "https://api.openai.com/v1"
+    ).rstrip("/")
+    llm_model = (
+        os.environ.get("REPORT_LLM_MODEL")
+        or env_file_values.get("REPORT_LLM_MODEL")
+        or os.environ.get("LLM_MODEL")
+        or env_file_values.get("LLM_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or env_file_values.get("OPENAI_MODEL")
+    )
+    llm_request_timeout_seconds = float(
+        os.environ.get("REPORT_LLM_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("REPORT_LLM_REQUEST_TIMEOUT_SECONDS")
+        or os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS")
+        or env_file_values.get("LLM_REQUEST_TIMEOUT_SECONDS")
+        or "60"
+    )
 
     migrations_dir = Path(migrations_dir_value).expanduser()
     if not migrations_dir.is_absolute():
@@ -155,4 +191,8 @@ def get_settings() -> Settings:
         finnhub_base_url=finnhub_base_url,
         finnhub_rate_limit_per_second=finnhub_rate_limit_per_second,
         finnhub_request_timeout_seconds=finnhub_request_timeout_seconds,
+        llm_api_key=llm_api_key,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        llm_request_timeout_seconds=llm_request_timeout_seconds,
     )

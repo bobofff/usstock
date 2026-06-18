@@ -8,7 +8,7 @@
 * 将热点映射到相关美股标的
 * 用结构化财务数据做硬筛选
 * 用 AI 辅助阅读财报文本和新闻材料
-* 输出每日候选股评分、观察清单和交易计划
+* 输出每日候选股评分、观察清单、分析报告和交易计划
 
 后续在回测和模拟盘稳定后，再考虑接入真实交易通道。实盘阶段默认采用“系统生成信号 + 人工确认下单”的模式，避免过早进入不可控的全自动交易。
 
@@ -380,6 +380,19 @@ usstock discover promote-topics --slug quantum_computing
 usstock discover daily --skip-sync --top-n 25
 ```
 
+基于已有候选评分和观察清单生成新闻驱动分析报告：
+
+```bash
+usstock report daily --top-n 10
+usstock report daily --top-n 10 --save-markdown
+```
+
+报告会写入 `daily_analysis_reports`，同时可以保存 Markdown 到 `reports/`。默认使用规则模型生成事件摘要、相关理由、关注点和风险提示；如果需要 LLM 增强摘要和表达，可以在 `.env` 中配置 `REPORT_LLM_API_KEY`、`REPORT_LLM_BASE_URL`、`REPORT_LLM_MODEL` 和 `REPORT_LLM_REQUEST_TIMEOUT_SECONDS`，然后运行：
+
+```bash
+usstock report daily --top-n 10 --use-llm --save-markdown
+```
+
 如果需要让它按固定间隔循环执行，可以使用：
 
 ```bash
@@ -417,7 +430,7 @@ http://127.0.0.1:7878
 
 第一版面板只覆盖最常用的内部操作：
 
-* 查看股票池、SEC 公告、GDELT 文章、Finnhub 新闻和最近迁移记录。
+* 查看股票池、SEC 公告、GDELT 文章、Finnhub 新闻、分析报告和最近迁移记录。
 * 手工新增或更新观察标的。
 * 触发 SEC 公司映射、单只 ticker、GDELT query 和 Finnhub News 同步。
 

@@ -26,6 +26,7 @@ from usstock.data import finnhub
 from usstock.data import gdelt, sec
 from usstock.discovery import daily as discovery
 from usstock.discovery import topic_candidates
+from usstock.reports import daily_report
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -234,6 +235,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "/gdelt": render_gdelt,
             "/finnhub": render_finnhub,
             "/topics": render_topics,
+            "/reports": render_reports,
             "/tasks": render_tasks,
         }
         renderer = routes.get(parsed.path)
@@ -378,6 +380,25 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path == "/actions/report-daily":
+                run_date = daily_report.parse_run_date(form_value(form, "run_date") or None)
+                top_n = parse_positive_int(form_value(form, "top_n")) or daily_report.DEFAULT_TOP_N
+                profile = form_value(form, "profile") or daily_report.DEFAULT_PROFILE
+                report = daily_report.generate_daily_report(
+                    database_url=database_url,
+                    run_date=run_date,
+                    profile=profile,
+                    top_n=top_n,
+                    use_llm=form_bool(form, "use_llm"),
+                )
+                report_href = "/reports?uid=" + urllib.parse.quote(report.report_uid)
+                self.redirect(
+                    report_href,
+                    f"每日分析报告生成完成：候选={len(report.candidates)}。",
+                    ok=True,
+                )
+                return
+
             if parsed.path == "/actions/topic-extract":
                 result = topic_candidates.run_topic_extraction(
                     database_url=database_url,
@@ -487,6 +508,8 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             fallback_path = (
                 "/topics?pane=candidates"
                 if parsed.path in {"/actions/topic-promote", "/actions/topic-ignore"}
+                else "/reports"
+                if parsed.path == "/actions/report-daily"
                 else "/tasks"
             )
             self.redirect(fallback_path, f"操作失败：{exc}", ok=False)
@@ -1720,6 +1743,119 @@ def render_topics(
     return layout("主题", body, active="/topics", query=query)
 
 
+def render_reports(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+) -> str:
+    selected_uid = form_value(query, "uid")
+    today = date.today()
+
+    try:
+        with connect_database(database_url) as conn:
+            has_reports = table_exists(conn, "daily_analysis_reports")
+            summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE run_date = current_date) AS today,
+                        count(*) FILTER (WHERE llm_used) AS llm_used,
+                        max(generated_at) AS last_generated_at
+                    FROM daily_analysis_reports
+                    """,
+                )
+                if has_reports
+                else {}
+            )
+            report_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT report_uid, run_date, profile, candidate_count,
+                           llm_used, llm_model, summary, generated_at
+                    FROM daily_analysis_reports
+                    ORDER BY generated_at DESC
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+                if has_reports
+                else []
+            )
+            if not selected_uid and report_rows:
+                selected_uid = str(report_rows[0]["report_uid"])
+            selected_report = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT report_uid, run_date, profile, candidate_count,
+                           llm_used, llm_model, markdown_body, summary,
+                           structured_payload, generated_at
+                    FROM daily_analysis_reports
+                    WHERE report_uid = %s
+                    LIMIT 1
+                    """,
+                    (selected_uid,),
+                )
+                if has_reports and selected_uid
+                else {}
+            )
+    except Exception as exc:
+        return render_database_error(exc, active="/reports")
+
+    metrics = [
+        metric_box("报告总数", summary.get("total"), f"今日 {fmt(summary.get('today'))}"),
+        metric_box("LLM 增强", summary.get("llm_used"), "可选摘要增强"),
+        metric_box("最近生成", summary.get("last_generated_at"), "daily_analysis_reports"),
+    ]
+
+    selected_html = render_selected_report(selected_report)
+    body = f"""
+    <section class="toolbar">
+      <div>
+        <h1>分析报告</h1>
+        <p class="page-kicker">基于每日候选评分生成事件解释、相关理由和风险提示。</p>
+      </div>
+    </section>
+    <section>
+      <form class="discovery-panel" method="post" action="/actions/report-daily">
+        <div class="task-panel-header">
+          <div>
+            <span class="eyebrow">报告生成</span>
+            <h2>每日新闻驱动分析报告</h2>
+            <p>复用 daily_candidate_scores 和 daily_watchlists，不重新抓取外部数据。</p>
+          </div>
+          <div class="button-row action-row">
+            <button class="primary" type="submit">生成报告</button>
+          </div>
+        </div>
+        <div class="form-sections">
+          <div class="form-section">
+            <h3>报告参数</h3>
+            <div class="field-grid">
+              <label>运行日期 <input name="run_date" type="date" value="{today.isoformat()}"></label>
+              <label>profile <input name="profile" value="{e(daily_report.DEFAULT_PROFILE)}"></label>
+              <label>候选数量 <input name="top_n" type="number" min="1" value="{daily_report.DEFAULT_TOP_N}"></label>
+            </div>
+            <div class="checkbox-stack">
+              <label><input type="checkbox" name="use_llm" value="1"> 使用 LLM 增强摘要和风险提示</label>
+            </div>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="metrics">{"".join(metrics)}</section>
+    <section>
+      <h2>历史报告</h2>
+      {render_reports_table(report_rows, selected_uid=selected_uid)}
+    </section>
+    {selected_html}
+    """
+    return layout("分析报告", body, active="/reports", query=query)
+
+
 def render_tasks(
     *,
     database_url: str | None,
@@ -2424,6 +2560,74 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def render_reports_table(
+    rows: list[dict[str, Any]],
+    *,
+    selected_uid: str,
+) -> str:
+    if not rows:
+        return empty_state("暂无分析报告。可以先在本页生成一份。")
+
+    body = []
+    for row in rows:
+        uid = str(row.get("report_uid") or "")
+        active = " active-row" if uid == selected_uid else ""
+        href = "/reports?uid=" + urllib.parse.quote(uid)
+        body.append(
+            f"""
+            <tr class="{active}">
+              <td><a href="{e(href)}">{e(row.get("run_date"))}</a></td>
+              <td>{e(row.get("profile"))}</td>
+              <td>{fmt(row.get("candidate_count"))}</td>
+              <td>{'是' if row.get("llm_used") else '否'}<div class="subtle">{e(row.get("llm_model"))}</div></td>
+              <td>{fmt(row.get("generated_at"))}</td>
+              <td>{e(clip_text(str(row.get("summary") or ""), 120))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>日期</th><th>profile</th><th>候选数</th>"
+            "<th>LLM</th><th>生成时间</th><th>摘要</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_selected_report(row: dict[str, Any]) -> str:
+    if not row:
+        return """
+        <section>
+          <h2>报告预览</h2>
+          <div class="empty">暂无可预览报告。</div>
+        </section>
+        """
+
+    payload = row.get("structured_payload") or {}
+    candidates = payload.get("candidates") if isinstance(payload, dict) else []
+    candidate_hint = ""
+    if isinstance(candidates, list) and candidates:
+        tickers = ", ".join(
+            str(candidate.get("ticker"))
+            for candidate in candidates[:8]
+            if isinstance(candidate, dict) and candidate.get("ticker")
+        )
+        candidate_hint = f"<p class=\"subtle\">候选：{e(tickers)}</p>" if tickers else ""
+    markdown = row.get("markdown_body") or ""
+    return f"""
+    <section>
+      <div class="task-section-header">
+        <div>
+          <h2>报告预览</h2>
+          <p>{e(row.get("report_uid"))}</p>
+          {candidate_hint}
+        </div>
+      </div>
+      <pre class="report-preview">{e(markdown)}</pre>
+    </section>
+    """
+
+
 def format_ticker_list(value: Any) -> str:
     if not value:
         return "-"
@@ -2936,6 +3140,7 @@ def layout(
         ("/gdelt", "GDELT", "全球新闻"),
         ("/finnhub", "Finnhub", "金融新闻"),
         ("/topics", "主题", "热点与评分"),
+        ("/reports", "报告", "分析输出"),
         ("/tasks", "同步", "数据任务"),
     ]
     nav_parts = []
@@ -3927,6 +4132,9 @@ def layout(
     tbody tr:last-child td {{
       border-bottom: 0;
     }}
+    tr.active-row td {{
+      background: var(--surface-soft);
+    }}
     th {{
       position: sticky;
       top: 0;
@@ -3960,6 +4168,19 @@ def layout(
     .badge.muted {{
       background: var(--badge-muted-bg);
       color: var(--muted);
+    }}
+    .report-preview {{
+      max-height: 680px;
+      overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+      color: var(--ink);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.55;
     }}
     .empty {{
       padding: 16px;
