@@ -20,6 +20,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from usstock.config.settings import get_settings
+from usstock.runtime_logs import log_sync_operation
 
 
 ARTLIST_MODE = "artlist"
@@ -245,6 +246,48 @@ def get_database_url(database_url: str | None = None) -> str:
     if not database_url:
         raise GdeltError("缺少 DATABASE_URL，请在环境变量或 .env 中配置。")
     return database_url
+
+
+def _count_log_result(count: int) -> dict[str, int]:
+    return {"count": count}
+
+
+def _articles_log_details(
+    *,
+    query: str,
+    timespan: str | None = DEFAULT_TIMESPAN,
+    start_datetime: datetime | str | None = None,
+    end_datetime: datetime | str | None = None,
+    sort: str | None = DEFAULT_SORT,
+    max_records: int | None = DEFAULT_MAX_RECORDS,
+    database_url: str | None = None,
+    client: GdeltDocClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "query": query,
+        "timespan": timespan,
+        "start_datetime": start_datetime,
+        "end_datetime": end_datetime,
+        "sort": sort,
+        "max_records": max_records,
+    }
+
+
+def _timeline_log_details(
+    *,
+    query: str,
+    timespan: str | None = DEFAULT_TIMESPAN,
+    start_datetime: datetime | str | None = None,
+    end_datetime: datetime | str | None = None,
+    database_url: str | None = None,
+    client: GdeltDocClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "query": query,
+        "timespan": timespan,
+        "start_datetime": start_datetime,
+        "end_datetime": end_datetime,
+    }
 
 
 def build_query_uid(
@@ -643,6 +686,12 @@ def upsert_timeline_points(
     return count
 
 
+@log_sync_operation(
+    source="GDELT",
+    action="sync_articles",
+    details_builder=_articles_log_details,
+    result_builder=_count_log_result,
+)
 def sync_articles(
     *,
     query: str,
@@ -698,6 +747,12 @@ def sync_articles(
             return upsert_articles(conn, articles)
 
 
+@log_sync_operation(
+    source="GDELT",
+    action="sync_timeline",
+    details_builder=_timeline_log_details,
+    result_builder=_count_log_result,
+)
 def sync_timeline(
     *,
     query: str,

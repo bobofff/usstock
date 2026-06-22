@@ -5,25 +5,30 @@ from __future__ import annotations
 import argparse
 import html
 import math
+import re
 import sys
 import threading
 import traceback
 import urllib.parse
-from collections.abc import Mapping
+import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import psycopg
 from psycopg import Connection
 from psycopg.rows import dict_row
 
-from usstock.config.settings import get_settings
+from usstock.backtest import engine as backtest_engine
+from usstock.config.settings import PROJECT_ROOT, get_settings
 from usstock.data import finnhub
 from usstock.data import gdelt, sec
+from usstock.data import market
 from usstock.discovery import daily as discovery
 from usstock.discovery import topic_candidates
 from usstock.reports import daily_report
@@ -31,6 +36,7 @@ from usstock.reports import daily_report
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
+DEFAULT_DISCOVERY_INTERVAL_MINUTES = 60
 PAGE_SIZE = 100
 TABLE_PAGE_SIZE = 15
 MAX_POST_BYTES = 64 * 1024
@@ -51,6 +57,9 @@ TOPIC_CLOUD_PALETTE = (
 PICO_CSS_URL = "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
 HTMX_JS_URL = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
 ALPINE_JS_URL = "https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"
+MARKDOWN_INLINE_PATTERN = re.compile(
+    r"`([^`]+)`|\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)"
+)
 TOPIC_PANES = [
     ("overview", "概览"),
     ("library", "主题库"),
@@ -61,8 +70,17 @@ TOPIC_PANES = [
 TASK_PANES = [
     ("discovery", "自动发现"),
     ("manual", "手动补数"),
+    ("backtest", "日报复盘"),
     ("topic-extraction", "主题后处理"),
 ]
+DISCOVERY_PROGRESS_STAGES = (
+    ("prepare", "准备数据库"),
+    ("finnhub", "Finnhub 新闻"),
+    ("gdelt", "GDELT 主题新闻"),
+    ("sec", "SEC filings"),
+    ("scoring", "主题匹配与评分"),
+    ("persist", "保存结果"),
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,238 @@ class DiscoveryRunConfig:
     skip_finnhub_sync: bool
     skip_gdelt_sync: bool
     skip_sec_sync: bool
+
+
+class DiscoveryProgressStore:
+    """Thread-safe in-memory progress for the current or latest discovery run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._run_count = 0
+        self._snapshot = self._idle_snapshot()
+
+    def _idle_snapshot(self) -> dict[str, Any]:
+        return {
+            "run_id": None,
+            "trigger": None,
+            "status": "idle",
+            "message": "尚未运行。点击运行一次后显示阶段进度。",
+            "error": None,
+            "result": None,
+            "config": None,
+            "started_at": None,
+            "finished_at": None,
+            "updated_at": None,
+            "current_stage": None,
+            "percent": 0,
+            "run_count": self._run_count,
+            "stages": self._fresh_stages(),
+            "logs": [],
+        }
+
+    def _fresh_stages(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "key": key,
+                "label": label,
+                "status": "pending",
+                "completed": 0,
+                "total": None,
+                "detail": "",
+                "started_at": None,
+                "finished_at": None,
+            }
+            for key, label in DISCOVERY_PROGRESS_STAGES
+        ]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = dict(self._snapshot)
+            snapshot["stages"] = [dict(stage) for stage in self._snapshot["stages"]]
+            snapshot["logs"] = [dict(item) for item in self._snapshot["logs"]]
+            return snapshot
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._snapshot.get("status") == "running"
+
+    def begin(self, *, config: DiscoveryRunConfig, trigger: str) -> str | None:
+        with self._lock:
+            if self._snapshot.get("status") == "running":
+                return None
+
+            now = datetime.now()
+            run_id = now.strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+            self._snapshot = {
+                "run_id": run_id,
+                "trigger": trigger,
+                "status": "running",
+                "message": "自动发现任务已开始。",
+                "error": None,
+                "result": None,
+                "config": config,
+                "started_at": now,
+                "finished_at": None,
+                "updated_at": now,
+                "current_stage": "prepare",
+                "percent": 0,
+                "run_count": self._run_count,
+                "stages": self._fresh_stages(),
+                "logs": [],
+            }
+            self._append_log_locked(
+                "info",
+                "自动发现任务已开始。",
+                stage="prepare",
+                status="running",
+            )
+            return run_id
+
+    def progress_callback(self, run_id: str) -> Callable[[dict[str, Any]], None]:
+        def callback(event: dict[str, Any]) -> None:
+            self.record_event(run_id, event)
+
+        return callback
+
+    def record_event(self, run_id: str, event: Mapping[str, Any]) -> None:
+        with self._lock:
+            if self._snapshot.get("run_id") != run_id:
+                return
+            if self._snapshot.get("status") != "running":
+                return
+
+            now = datetime.now()
+            stage_key = str(event.get("stage") or "")
+            stage_status = str(event.get("status") or "")
+            stage = self._stage_locked(stage_key) if stage_key else None
+            if stage:
+                if stage_status:
+                    stage["status"] = stage_status
+                if event.get("completed") is not None:
+                    stage["completed"] = int(event["completed"])
+                if event.get("total") is not None:
+                    stage["total"] = int(event["total"])
+                if event.get("detail") is not None:
+                    stage["detail"] = str(event["detail"])
+                if stage_status == "running" and stage.get("started_at") is None:
+                    stage["started_at"] = now
+                if stage_status in {"success", "warning", "fail", "skipped"}:
+                    if stage.get("started_at") is None:
+                        stage["started_at"] = now
+                    stage["finished_at"] = now
+                if stage_status != "pending":
+                    self._snapshot["current_stage"] = stage_key
+
+            message = str(event.get("message") or "")
+            if message:
+                self._snapshot["message"] = message
+                self._append_log_locked(
+                    self._log_level(stage_status),
+                    message,
+                    stage=stage_key,
+                    status=stage_status,
+                    detail=event.get("detail"),
+                )
+
+            self._snapshot["updated_at"] = now
+            self._snapshot["percent"] = self._calculate_percent_locked()
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        message: str,
+        result: Mapping[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        with self._lock:
+            if self._snapshot.get("run_id") != run_id:
+                return
+
+            now = datetime.now()
+            if status == "fail":
+                current_stage = self._stage_locked(
+                    str(self._snapshot.get("current_stage") or "")
+                )
+                if current_stage and current_stage.get("status") == "running":
+                    current_stage["status"] = "fail"
+                    current_stage["finished_at"] = now
+
+            if status == "success":
+                self._run_count += 1
+
+            self._snapshot["status"] = status
+            self._snapshot["message"] = message
+            self._snapshot["error"] = str(error) if error else None
+            self._snapshot["result"] = dict(result or {})
+            self._snapshot["finished_at"] = now
+            self._snapshot["updated_at"] = now
+            self._snapshot["run_count"] = self._run_count
+            self._snapshot["percent"] = 100 if status == "success" else self._calculate_percent_locked()
+            self._append_log_locked(
+                "error" if status == "fail" else "info",
+                message,
+                stage=str(self._snapshot.get("current_stage") or ""),
+                status=status,
+            )
+
+    def _stage_locked(self, key: str) -> dict[str, Any] | None:
+        for stage in self._snapshot["stages"]:
+            if stage["key"] == key:
+                return stage
+        return None
+
+    def _append_log_locked(
+        self,
+        level: str,
+        message: str,
+        *,
+        stage: str = "",
+        status: str = "",
+        detail: Any = None,
+    ) -> None:
+        self._snapshot["logs"].append(
+            {
+                "timestamp": datetime.now(),
+                "level": level,
+                "stage": stage,
+                "status": status,
+                "detail": "" if detail is None else str(detail),
+                "message": message,
+            }
+        )
+
+    def _calculate_percent_locked(self) -> int:
+        stages = self._snapshot["stages"]
+        if not stages:
+            return 0
+
+        units = Decimal("0")
+        for stage in stages:
+            status = stage.get("status")
+            if status in {"success", "warning", "skipped"}:
+                units += Decimal("1")
+                continue
+            if status == "fail":
+                continue
+            if status == "running":
+                total = stage.get("total")
+                completed = stage.get("completed") or 0
+                if total:
+                    units += min(Decimal(completed) / Decimal(total), Decimal("0.99"))
+                else:
+                    units += Decimal("0.35")
+
+        return int((units / Decimal(len(stages)) * Decimal("100")).to_integral_value())
+
+    @staticmethod
+    def _log_level(stage_status: str) -> str:
+        if stage_status == "fail":
+            return "error"
+        if stage_status == "warning":
+            return "warning"
+        return "info"
 
 
 class DiscoveryScheduler:
@@ -169,17 +419,37 @@ class DiscoveryScheduler:
             self._last_run_started_at = datetime.now()
             self._last_error = None
 
+        run_id = DISCOVERY_PROGRESS.begin(config=config, trigger="schedule")
+        if not run_id:
+            with self._lock:
+                self._last_message = "已有自动发现任务运行，本轮定时跳过。"
+                self._last_run_finished_at = datetime.now()
+                self._is_running_once = False
+            return
+
         try:
-            result = run_discovery_daily(database_url, config)
-            message = (
-                f"{result.run_date.isoformat()} 自动发现完成："
-                f"候选 {len(result.candidates)} 个，"
-                f"警告 {len(result.warnings)} 条。"
+            result = run_discovery_daily(
+                database_url,
+                config,
+                progress_callback=DISCOVERY_PROGRESS.progress_callback(run_id),
+            )
+            message = format_discovery_result_message(result)
+            DISCOVERY_PROGRESS.finish(
+                run_id,
+                status="success",
+                message=message,
+                result=discovery_result_summary(result),
             )
             with self._lock:
                 self._run_count += 1
                 self._last_message = message
         except Exception as exc:  # pragma: no cover - background safety net.
+            DISCOVERY_PROGRESS.finish(
+                run_id,
+                status="fail",
+                message=f"自动发现失败：{exc}",
+                error=exc,
+            )
             with self._lock:
                 self._last_error = str(exc)
                 self._last_message = f"自动发现失败：{exc}"
@@ -189,6 +459,7 @@ class DiscoveryScheduler:
                 self._is_running_once = False
 
 
+DISCOVERY_PROGRESS = DiscoveryProgressStore()
 DISCOVERY_SCHEDULER = DiscoveryScheduler()
 
 
@@ -224,7 +495,20 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/partials/discovery-status":
             self.send_html(
                 HTTPStatus.OK,
-                render_discovery_scheduler_status(DISCOVERY_SCHEDULER.snapshot()),
+                render_discovery_scheduler_status(
+                    DISCOVERY_SCHEDULER.snapshot(),
+                    DISCOVERY_PROGRESS.snapshot(),
+                    include_oob_actions=True,
+                ),
+            )
+            return
+        if parsed.path == "/partials/discovery-progress":
+            self.send_html(
+                HTTPStatus.OK,
+                render_discovery_progress_fragment(
+                    DISCOVERY_PROGRESS.snapshot(),
+                    include_oob_actions=True,
+                ),
             )
             return
 
@@ -236,6 +520,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "/finnhub": render_finnhub,
             "/topics": render_topics,
             "/reports": render_reports,
+            "/backtest": render_backtest,
             "/tasks": render_tasks,
         }
         renderer = routes.get(parsed.path)
@@ -368,14 +653,20 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/actions/discovery-daily":
                 config = parse_discovery_run_config(form)
-                result = run_discovery_daily(database_url, config)
+                run_id = start_discovery_once(
+                    database_url=get_database_url(database_url),
+                    config=config,
+                )
+                if not run_id:
+                    self.redirect(
+                        "/tasks?pane=discovery",
+                        "自动发现正在运行，请等待当前任务完成。",
+                        ok=False,
+                    )
+                    return
                 self.redirect(
-                    "/tasks",
-                    (
-                        "自动热点发现完成："
-                        f"候选={len(result.candidates)}，"
-                        f"警告={len(result.warnings)}。"
-                    ),
+                    "/tasks?pane=discovery",
+                    f"自动热点发现已开始：run_id={run_id}。",
                     ok=True,
                 )
                 return
@@ -395,6 +686,69 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 self.redirect(
                     report_href,
                     f"每日分析报告生成完成：候选={len(report.candidates)}。",
+                    ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/market-import-prices":
+                csv_path = resolve_project_path(form_value(form, "csv_path"))
+                ticker = clean_blank(form_value(form, "ticker"))
+                data_source = form_value(form, "data_source") or market.DEFAULT_DATA_SOURCE
+                count = market.import_prices_csv(
+                    csv_path=csv_path,
+                    database_url=database_url,
+                    ticker=ticker,
+                    data_source=data_source,
+                )
+                self.redirect(
+                    safe_return_path(form, "/backtest"),
+                    f"日线价格导入完成：{count} 行。",
+                    ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/market-sync-stooq":
+                result = market.sync_stooq_daily_prices(
+                    database_url=database_url,
+                    tickers=market.parse_ticker_list(form_value(form, "tickers")),
+                    from_date=market.parse_optional_date(
+                        form_value(form, "from_date"),
+                        field_name="开始日期",
+                    ),
+                    to_date=market.parse_optional_date(
+                        form_value(form, "to_date"),
+                        field_name="结束日期",
+                    ),
+                    from_report_candidates=form_bool(form, "from_report_candidates"),
+                    profile=form_value(form, "profile") or backtest_engine.DEFAULT_PROFILE,
+                    top_n=(
+                        parse_positive_int(form_value(form, "top_n"))
+                        or backtest_engine.DEFAULT_TOP_N
+                    ),
+                )
+                self.redirect(
+                    safe_return_path(form, "/backtest"),
+                    format_market_sync_result_message(result),
+                    ok=not result.failed_tickers,
+                )
+                return
+
+            if parsed.path == "/actions/backtest-reports":
+                result = backtest_engine.run_report_backtest(
+                    database_url=database_url,
+                    start_date=backtest_engine.parse_run_date(form_value(form, "from_date")),
+                    end_date=backtest_engine.parse_run_date(form_value(form, "to_date")),
+                    profile=form_value(form, "profile") or backtest_engine.DEFAULT_PROFILE,
+                    top_n=(
+                        parse_positive_int(form_value(form, "top_n"))
+                        or backtest_engine.DEFAULT_TOP_N
+                    ),
+                    price_source=clean_blank(form_value(form, "price_source")),
+                    persist=not form_bool(form, "no_persist"),
+                )
+                self.redirect(
+                    safe_return_path(form, "/backtest"),
+                    format_backtest_result_message(result),
                     ok=True,
                 )
                 return
@@ -475,7 +829,8 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/actions/discovery-schedule-start":
                 config = parse_discovery_run_config(form)
                 interval_minutes = (
-                    parse_positive_int(form_value(form, "interval_minutes")) or 60
+                    parse_positive_int(form_value(form, "interval_minutes"))
+                    or DEFAULT_DISCOVERY_INTERVAL_MINUTES
                 )
                 started = DISCOVERY_SCHEDULER.start(
                     database_url=get_database_url(database_url),
@@ -508,6 +863,12 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             fallback_path = (
                 "/topics?pane=candidates"
                 if parsed.path in {"/actions/topic-promote", "/actions/topic-ignore"}
+                else "/backtest"
+                if parsed.path in {
+                    "/actions/market-import-prices",
+                    "/actions/market-sync-stooq",
+                    "/actions/backtest-reports",
+                }
                 else "/reports"
                 if parsed.path == "/actions/report-daily"
                 else "/tasks"
@@ -1856,6 +2217,222 @@ def render_reports(
     return layout("分析报告", body, active="/reports", query=query)
 
 
+def render_backtest(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+) -> str:
+    body = f"""
+    <section class="toolbar">
+      <div>
+        <h1>日报复盘</h1>
+        <p class="page-kicker">导入日线价格后，验证日报候选股在 T+1、T+5、T+20 的后续表现。</p>
+      </div>
+    </section>
+    {render_backtest_workspace(database_url=database_url, query=query, return_path="/backtest")}
+    """
+    return layout("日报复盘", body, active="/backtest", query=query)
+
+
+def render_backtest_workspace(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+    return_path: str,
+) -> str:
+    today = date.today()
+    from_date = today - timedelta(days=30)
+    price_summary: dict[str, Any] = {}
+    performance_summary: dict[str, Any] = {}
+    price_rows: list[dict[str, Any]] = []
+    performance_rows: list[dict[str, Any]] = []
+    has_prices = False
+    has_performance = False
+
+    try:
+        with connect_database(database_url) as conn:
+            has_prices = table_exists(conn, "market_daily_prices")
+            has_performance = table_exists(conn, "daily_candidate_performance")
+            price_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(DISTINCT ticker) AS ticker_count,
+                        min(price_date) AS first_price_date,
+                        max(price_date) AS last_price_date,
+                        max(updated_at) AS last_updated_at
+                    FROM market_daily_prices
+                    """,
+                )
+                if has_prices
+                else {}
+            )
+            performance_summary = (
+                fetch_one(
+                    conn,
+                    """
+                    SELECT
+                        count(*) AS total,
+                        count(*) FILTER (WHERE performance_status = 'complete') AS complete,
+                        count(*) FILTER (WHERE performance_status = 'partial') AS partial,
+                        count(*) FILTER (WHERE return_5d_pct > 0) AS wins_5d,
+                        count(return_5d_pct) AS evaluated_5d,
+                        avg(return_1d_pct) AS avg_return_1d_pct,
+                        avg(return_5d_pct) AS avg_return_5d_pct,
+                        avg(return_20d_pct) AS avg_return_20d_pct,
+                        max(computed_at) AS last_computed_at
+                    FROM daily_candidate_performance
+                    """,
+                )
+                if has_performance
+                else {}
+            )
+            price_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT ticker, price_date, open_price, high_price, low_price,
+                           close_price, adjusted_close_price, volume, data_source,
+                           updated_at
+                    FROM market_daily_prices
+                    ORDER BY price_date DESC, ticker
+                    LIMIT 20
+                    """,
+                )
+                if has_prices
+                else []
+            )
+            performance_rows = (
+                fetch_all(
+                    conn,
+                    """
+                    SELECT run_date, profile, ticker, company_name, rank, score,
+                           attention_label, primary_topic_slug, entry_date,
+                           entry_close, return_1d_pct, return_5d_pct,
+                           max_drawdown_5d_pct, return_20d_pct,
+                           performance_status, missing_reason, computed_at
+                    FROM daily_candidate_performance
+                    ORDER BY computed_at DESC, run_date DESC, rank NULLS LAST, ticker
+                    LIMIT %s
+                    """,
+                    (PAGE_SIZE,),
+                )
+                if has_performance
+                else []
+            )
+    except Exception as exc:
+        return f"""
+        {render_backtest_forms(today=today, from_date=from_date, return_path=return_path)}
+        <section>
+          <div class="empty error-text">复盘数据读取失败：{e(exc)}</div>
+        </section>
+        """
+
+    evaluated_5d = performance_summary.get("evaluated_5d") or 0
+    wins_5d = performance_summary.get("wins_5d") or 0
+    win_rate_5d = None
+    if evaluated_5d:
+        win_rate_5d = Decimal(wins_5d) / Decimal(evaluated_5d) * Decimal("100")
+
+    metrics = [
+        metric_box(
+            "价格行数",
+            price_summary.get("total"),
+            f"标的 {fmt(price_summary.get('ticker_count'))}",
+        ),
+        metric_box(
+            "价格日期",
+            price_summary.get("last_price_date"),
+            f"起始 {fmt(price_summary.get('first_price_date'))}",
+        ),
+        metric_box(
+            "复盘记录",
+            performance_summary.get("total"),
+            f"完整 {fmt(performance_summary.get('complete'))} / 部分 {fmt(performance_summary.get('partial'))}",
+        ),
+        metric_box(
+            "T+5 胜率",
+            format_percent_value(win_rate_5d),
+            f"样本 {fmt(evaluated_5d)}",
+        ),
+        metric_box(
+            "T+5 平均收益",
+            format_percent_value(performance_summary.get("avg_return_5d_pct")),
+            "daily_candidate_performance",
+        ),
+        metric_box(
+            "最近复盘",
+            performance_summary.get("last_computed_at"),
+            "computed_at",
+        ),
+    ]
+
+    return f"""
+    {render_backtest_forms(today=today, from_date=from_date, return_path=return_path)}
+    <section class="metrics">{"".join(metrics)}</section>
+    <section>
+      <div class="task-section-header">
+        <div>
+          <h2>最近复盘结果</h2>
+          <p>收益率单位为百分比，T+5 回撤按入场后收盘价序列计算。</p>
+        </div>
+      </div>
+      {render_candidate_performance_table(performance_rows)}
+    </section>
+    <section>
+      <div class="task-section-header">
+        <div>
+          <h2>最近导入价格</h2>
+          <p>复盘优先使用 adjusted close，缺失时使用 close。</p>
+        </div>
+      </div>
+      {render_market_daily_prices_table(price_rows)}
+    </section>
+    """
+
+
+def render_backtest_forms(*, today: date, from_date: date, return_path: str) -> str:
+    return f"""
+    <section class="task-grid">
+      <form method="post" action="/actions/market-sync-stooq">
+        <input type="hidden" name="return_path" value="{e(return_path)}">
+        <h2>自动同步日线价格</h2>
+        <p>默认从已生成日报候选中提取 ticker，并从 Stooq 同步免费日线数据。</p>
+        <label>开始日期 <input name="from_date" type="date" value="{from_date.isoformat()}" required></label>
+        <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}" required></label>
+        <label>指定 ticker <input name="tickers" placeholder="可空；如 AAPL,NVDA,MSFT"></label>
+        <label>profile <input name="profile" value="{e(backtest_engine.DEFAULT_PROFILE)}"></label>
+        <label>每份日报前 N 个 <input name="top_n" type="number" min="1" value="{backtest_engine.DEFAULT_TOP_N}"></label>
+        <label><input type="checkbox" name="from_report_candidates" value="1" checked> 从日报候选自动提取 ticker</label>
+        <button class="primary" type="submit">同步价格</button>
+      </form>
+      <form method="post" action="/actions/backtest-reports">
+        <input type="hidden" name="return_path" value="{e(return_path)}">
+        <h2>复盘日报候选</h2>
+        <p>读取已生成的 daily_analysis_reports，并写入候选股后续表现。</p>
+        <label>开始日期 <input name="from_date" type="date" value="{from_date.isoformat()}" required></label>
+        <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}" required></label>
+        <label>profile <input name="profile" value="{e(backtest_engine.DEFAULT_PROFILE)}"></label>
+        <label>每份日报前 N 个 <input name="top_n" type="number" min="1" value="{backtest_engine.DEFAULT_TOP_N}"></label>
+        <label>价格来源 <input name="price_source" value="{e(market.STOOQ_DATA_SOURCE)}"></label>
+        <label><input type="checkbox" name="no_persist" value="1"> 只预览，不写入复盘表</label>
+        <button class="primary" type="submit">运行复盘</button>
+      </form>
+      <form method="post" action="/actions/market-import-prices">
+        <input type="hidden" name="return_path" value="{e(return_path)}">
+        <h2>备用：导入 CSV</h2>
+        <p>如果接口临时不可用，可以填写本机项目内 CSV 路径，例如 data/raw/prices.csv。</p>
+        <label>CSV 路径 <input name="csv_path" required placeholder="data/raw/prices.csv"></label>
+        <label>ticker <input name="ticker" placeholder="CSV 没有 symbol 列时填写，如 NVDA"></label>
+        <label>数据来源 <input name="data_source" value="{e(market.DEFAULT_DATA_SOURCE)}"></label>
+        <button class="primary" type="submit">导入价格</button>
+      </form>
+    </section>
+    """
+
+
 def render_tasks(
     *,
     database_url: str | None,
@@ -1870,16 +2447,24 @@ def render_tasks(
         default="discovery",
     )
     discovery_status = render_discovery_scheduler_status(
-        DISCOVERY_SCHEDULER.snapshot()
+        DISCOVERY_SCHEDULER.snapshot(),
+        DISCOVERY_PROGRESS.snapshot(),
     )
     if pane == "manual":
         pane_content = render_manual_sync_tools(today=today, week_ago=week_ago)
+    elif pane == "backtest":
+        pane_content = render_backtest_workspace(
+            database_url=database_url,
+            query=query,
+            return_path="/tasks?pane=backtest",
+        )
     elif pane == "topic-extraction":
         pane_content = render_topic_extraction_task()
     else:
+        progress_snapshot = DISCOVERY_PROGRESS.snapshot()
         pane_content = f"""
         {discovery_status}
-        {render_discovery_task_panel()}
+        {render_discovery_task_panel(progress_snapshot)}
         """
     body = f"""
     <section class="toolbar">
@@ -1894,7 +2479,7 @@ def render_tasks(
     return layout("同步任务", body, active="/tasks", query=query)
 
 
-def render_discovery_task_panel() -> str:
+def render_discovery_task_panel(progress_snapshot: dict[str, Any]) -> str:
     return f"""
     <section>
       <form class="discovery-panel" method="post" action="/actions/discovery-daily">
@@ -1904,13 +2489,16 @@ def render_discovery_task_panel() -> str:
             <h2>自动热点发现</h2>
             <p>同步 Finnhub、GDELT 和 SEC，刷新主题命中与每日候选评分。</p>
           </div>
-          <div class="button-row action-row">
-            <button class="primary" type="submit" formaction="/actions/discovery-daily">运行一次</button>
-            <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
-            <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
-          </div>
+          {render_discovery_action_row(progress_snapshot)}
         </div>
+        {render_discovery_progress_fragment(progress_snapshot)}
         <div class="form-sections">
+          <div class="form-section">
+            <h3>定时设置</h3>
+            <div class="field-grid">
+              <label>每 N 分钟执行一次 <input name="interval_minutes" type="number" min="1" value="{DEFAULT_DISCOVERY_INTERVAL_MINUTES}"></label>
+            </div>
+          </div>
           <div class="form-section">
             <h3>发现参数</h3>
             <div class="field-grid">
@@ -1924,7 +2512,6 @@ def render_discovery_task_panel() -> str:
             <div class="field-grid">
               <label>扫描标的数 <input name="max_sec_tickers" type="number" min="1" value="{discovery.DEFAULT_MAX_SEC_TICKERS}"></label>
               <label>filing 数量 <input name="sec_filing_limit" type="number" min="1" value="{discovery.DEFAULT_SEC_FILING_LIMIT}"></label>
-              <label>定时间隔分钟 <input name="interval_minutes" type="number" min="1" value="60"></label>
             </div>
             <div class="checkbox-stack">
               <label><input type="checkbox" name="include_company_facts" value="1"> 同步 company facts</label>
@@ -1942,6 +2529,225 @@ def render_discovery_task_panel() -> str:
       </form>
     </section>
     """
+
+
+def render_discovery_action_row(
+    progress_snapshot: dict[str, Any],
+    *,
+    include_oob: bool = False,
+) -> str:
+    running = progress_snapshot.get("status") == "running"
+    oob_attr = ' hx-swap-oob="outerHTML"' if include_oob else ""
+    run_disabled = " disabled" if running else ""
+    run_busy = ' aria-busy="true"' if running else ""
+    run_label = "同步中..." if running else "运行一次"
+    return f"""
+    <div id="discovery-action-row" class="button-row action-row"{oob_attr}>
+      <button
+        id="run-discovery-once-button"
+        class="primary"
+        type="submit"
+        formaction="/actions/discovery-daily"
+        {run_disabled}{run_busy}
+      >{run_label}</button>
+      <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
+      <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
+    </div>
+    """
+
+
+def render_discovery_progress_fragment(
+    progress_snapshot: dict[str, Any],
+    *,
+    include_oob_actions: bool = False,
+) -> str:
+    status = str(progress_snapshot.get("status") or "idle")
+    percent = max(0, min(100, int(progress_snapshot.get("percent") or 0)))
+    current_stage = discovery_progress_current_stage(progress_snapshot)
+    started_at = progress_snapshot.get("started_at")
+    finished_at = progress_snapshot.get("finished_at")
+    result = progress_snapshot.get("result") or {}
+    error = progress_snapshot.get("error")
+    result_html = ""
+    if result:
+        result_html = f"""
+        <div class="progress-summary">
+          <span>候选 {fmt(result.get("candidate_count"))}</span>
+          <span>警告 {fmt(result.get("warning_count"))}</span>
+          <span>运行次数 {fmt(progress_snapshot.get("run_count"))}</span>
+        </div>
+        """
+    error_html = f'<p class="error-text">{e(error)}</p>' if error else ""
+    oob_html = (
+        render_discovery_action_row(progress_snapshot, include_oob=True)
+        if include_oob_actions
+        else ""
+    )
+
+    return f"""
+    <div
+      id="discovery-progress"
+      class="progress-panel progress-{e(status)}"
+      hx-get="/partials/discovery-progress"
+      hx-trigger="load, every 1s"
+      hx-disinherit="hx-target hx-select hx-swap hx-indicator"
+      hx-target="this"
+      hx-swap="outerHTML"
+    >
+      <div class="progress-heading">
+        <div>
+          <span class="eyebrow">运行过程</span>
+          <h3>{e(current_stage or "等待运行")}</h3>
+          <p>{e(progress_snapshot.get("message"))}</p>
+        </div>
+        <div class="progress-meta">
+          {render_discovery_progress_badge(status)}
+          <span>{e(discovery_progress_trigger_label(progress_snapshot.get("trigger")))}</span>
+          <span>耗时 {e(format_duration(started_at, finished_at))}</span>
+        </div>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}">
+        <div class="progress-fill" style="width: {percent}%"></div>
+      </div>
+      <div class="progress-percent">{percent}%</div>
+      <div class="stage-list">
+        {render_discovery_stage_rows(progress_snapshot)}
+      </div>
+      {result_html}
+      {error_html}
+      <div class="progress-log">
+        <div class="progress-log-title">历史节点</div>
+        {render_discovery_log_rows(progress_snapshot)}
+      </div>
+    </div>
+    {oob_html}
+    """
+
+
+def render_discovery_progress_badge(status: str) -> str:
+    if status == "running":
+        return '<span class="badge watch">运行中</span>'
+    if status == "success":
+        return '<span class="badge ok">已完成</span>'
+    if status == "fail":
+        return '<span class="badge error">失败</span>'
+    return '<span class="badge muted">未运行</span>'
+
+
+def discovery_progress_trigger_label(trigger: Any) -> str:
+    if trigger == "manual":
+        return "手动运行"
+    if trigger == "schedule":
+        return "定时运行"
+    return "等待中"
+
+
+def discovery_progress_current_stage(progress_snapshot: dict[str, Any]) -> str:
+    stage_key = progress_snapshot.get("current_stage")
+    for stage in progress_snapshot.get("stages") or []:
+        if stage.get("key") == stage_key:
+            return str(stage.get("label") or "")
+    return ""
+
+
+def render_discovery_stage_rows(progress_snapshot: dict[str, Any]) -> str:
+    rows = []
+    for stage in progress_snapshot.get("stages") or []:
+        status = str(stage.get("status") or "pending")
+        rows.append(
+            f"""
+            <div class="stage-row is-{e(status)}">
+              <span class="stage-mark">{e(stage_status_mark(status))}</span>
+              <div class="stage-copy">
+                <strong>{e(stage.get("label"))}</strong>
+                <span>{e(stage.get("detail") or stage_status_label(status))}</span>
+              </div>
+              <span class="stage-count">{e(format_stage_count(stage))}</span>
+            </div>
+            """
+        )
+    return "".join(rows)
+
+
+def render_discovery_log_rows(progress_snapshot: dict[str, Any]) -> str:
+    logs = progress_snapshot.get("logs") or []
+    if not logs:
+        return '<p class="subtle">暂无历史节点。</p>'
+
+    rows = []
+    for item in logs:
+        timestamp = item.get("timestamp")
+        time_text = timestamp.strftime("%H:%M:%S") if isinstance(timestamp, datetime) else "-"
+        level = str(item.get("level") or "info")
+        stage_label = discovery_stage_label(item.get("stage"))
+        status_label = stage_status_label(str(item.get("status") or ""))
+        detail = str(item.get("detail") or "")
+        meta_parts = [part for part in (stage_label, status_label, detail) if part]
+        rows.append(
+            f"""
+            <div class="progress-log-row log-{e(level)}">
+              <time>{e(time_text)}</time>
+              <div>
+                <span class="progress-log-meta">{e(" / ".join(meta_parts))}</span>
+                <span>{e(item.get("message"))}</span>
+              </div>
+            </div>
+            """
+        )
+    return "".join(rows)
+
+
+def discovery_stage_label(stage_key: Any) -> str:
+    for key, label in DISCOVERY_PROGRESS_STAGES:
+        if key == stage_key:
+            return label
+    return ""
+
+
+def stage_status_label(status: str) -> str:
+    labels = {
+        "pending": "等待中",
+        "running": "进行中",
+        "success": "完成",
+        "warning": "完成，有警告",
+        "skipped": "已跳过",
+        "fail": "失败",
+    }
+    return labels.get(status, status)
+
+
+def stage_status_mark(status: str) -> str:
+    marks = {
+        "success": "✓",
+        "warning": "!",
+        "running": "→",
+        "skipped": "-",
+        "fail": "!",
+    }
+    return marks.get(status, "·")
+
+
+def format_stage_count(stage: Mapping[str, Any]) -> str:
+    total = stage.get("total")
+    completed = stage.get("completed") or 0
+    if total is None:
+        return stage_status_label(str(stage.get("status") or "pending"))
+    if int(total) <= 0:
+        return "-"
+    return f"{int(completed)}/{int(total)}"
+
+
+def format_duration(started_at: Any, finished_at: Any = None) -> str:
+    if not isinstance(started_at, datetime):
+        return "-"
+
+    ended_at = finished_at if isinstance(finished_at, datetime) else datetime.now()
+    total_seconds = max(0, int((ended_at - started_at).total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def render_manual_sync_tools(*, today: date, week_ago: date) -> str:
@@ -2018,8 +2824,15 @@ def render_topic_extraction_task() -> str:
     """
 
 
-def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
+def render_discovery_scheduler_status(
+    snapshot: dict[str, Any],
+    progress_snapshot: dict[str, Any] | None = None,
+    *,
+    include_oob_actions: bool = False,
+) -> str:
+    progress_snapshot = progress_snapshot or {}
     active = bool(snapshot.get("active"))
+    progress_running = progress_snapshot.get("status") == "running"
     badge = (
         '<span class="badge ok">定时运行中</span>'
         if active
@@ -2027,10 +2840,13 @@ def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
     )
     running_once = (
         '<span class="badge watch">本轮执行中</span>'
-        if snapshot.get("is_running_once")
+        if snapshot.get("is_running_once") or progress_running
         else ""
     )
     error = snapshot.get("last_error")
+    progress_error = progress_snapshot.get("error")
+    if progress_error and not error:
+        error = progress_error
     error_html = f'<p class="error-text">{e(error)}</p>' if error else ""
     config = snapshot.get("config")
     config_hint = ""
@@ -2040,9 +2856,32 @@ def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
             f"回看={config.lookback_hours}h，"
             f"SEC={config.max_sec_tickers} 个标的"
         )
+    status_message = snapshot.get("last_message")
+    if progress_running:
+        current_stage = discovery_progress_current_stage(progress_snapshot)
+        status_message = (
+            f"{discovery_progress_trigger_label(progress_snapshot.get('trigger'))}"
+            f"执行中：{current_stage or '处理中'}，"
+            f"{fmt(progress_snapshot.get('percent'))}%。"
+        )
+    elif progress_snapshot.get("status") in {"success", "fail"}:
+        status_message = progress_snapshot.get("message") or status_message
+    history_html = ""
+    if progress_snapshot.get("logs"):
+        history_html = f"""
+        <div class="progress-log status-history">
+          <div class="progress-log-title">历史节点</div>
+          {render_discovery_log_rows(progress_snapshot)}
+        </div>
+        """
+    oob_html = (
+        render_discovery_action_row(progress_snapshot, include_oob=True)
+        if include_oob_actions
+        else ""
+    )
 
     return f"""
-    <section class="status-panel" hx-get="/partials/discovery-status" hx-trigger="every 10s" hx-target="this" hx-select=".status-panel" hx-swap="outerHTML">
+    <section class="status-panel" hx-get="/partials/discovery-status" hx-trigger="every 10s" hx-target="this" hx-swap="outerHTML">
       <div class="toolbar">
         <h2>自动发现定时任务</h2>
         <div>{badge} {running_once}</div>
@@ -2053,9 +2892,11 @@ def render_discovery_scheduler_status(snapshot: dict[str, Any]) -> str:
         {metric_box("上次开始", snapshot.get("last_run_started_at"), "自动发现")}
         {metric_box("上次完成", snapshot.get("last_run_finished_at"), "自动发现")}
       </div>
-      <p class="subtle">{e(snapshot.get("last_message"))}</p>
+      <p class="subtle">{e(status_message)}</p>
       {error_html}
+      {history_html}
     </section>
+    {oob_html}
     """
 
 
@@ -2090,6 +2931,8 @@ def parse_discovery_run_config(
 def run_discovery_daily(
     database_url: str | None,
     config: DiscoveryRunConfig,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> discovery.DailyDiscoveryResult:
     return discovery.run_daily_discovery(
         database_url=database_url,
@@ -2102,7 +2945,113 @@ def run_discovery_daily(
         skip_finnhub_sync=config.skip_finnhub_sync,
         skip_gdelt_sync=config.skip_gdelt_sync,
         skip_sec_sync=config.skip_sec_sync,
+        progress_callback=progress_callback,
     )
+
+
+def discovery_result_summary(
+    result: discovery.DailyDiscoveryResult,
+) -> dict[str, Any]:
+    return {
+        "run_date": result.run_date.isoformat(),
+        "candidate_count": len(result.candidates),
+        "warning_count": len(result.warnings),
+        "stats": result.stats,
+    }
+
+
+def format_discovery_result_message(result: discovery.DailyDiscoveryResult) -> str:
+    return (
+        f"{result.run_date.isoformat()} 自动发现完成："
+        f"候选 {len(result.candidates)} 个，"
+        f"警告 {len(result.warnings)} 条。"
+    )
+
+
+def format_backtest_result_message(result: backtest_engine.BacktestResult) -> str:
+    horizon = result.summary.get("horizons", {}).get("5", {})
+    avg_return = horizon.get("avg_return_pct") or "-"
+    win_rate = horizon.get("win_rate_pct") or "-"
+    return (
+        f"日报复盘完成：候选 {len(result.performances)} 条，"
+        f"T+5 样本 {horizon.get('evaluated') or 0}，"
+        f"胜率 {win_rate}%，平均收益 {avg_return}%。"
+    )
+
+
+def format_market_sync_result_message(result: market.MarketPriceSyncResult) -> str:
+    message = (
+        f"{result.provider} 日线同步完成：价格 {result.price_count} 行，"
+        f"成功 {len(result.synced_tickers)} / 请求 {len(result.requested_tickers)} 个 ticker。"
+    )
+    if result.missing_tickers:
+        message += " 缺少数据：" + ", ".join(result.missing_tickers[:10]) + "。"
+    if result.failed_tickers:
+        message += " 请求失败：" + ", ".join(result.failed_tickers[:10]) + "。"
+    return message
+
+
+def resolve_project_path(value: str) -> Path:
+    text = value.strip()
+    if not text:
+        raise AdminPanelError("CSV 路径不能为空。")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def safe_return_path(form: Mapping[str, list[str]], default: str) -> str:
+    value = form_value(form, "return_path") or default
+    if not value.startswith("/") or value.startswith("//") or "://" in value:
+        return default
+    return value
+
+
+def start_discovery_once(
+    *,
+    database_url: str,
+    config: DiscoveryRunConfig,
+) -> str | None:
+    run_id = DISCOVERY_PROGRESS.begin(config=config, trigger="manual")
+    if not run_id:
+        return None
+
+    thread = threading.Thread(
+        target=run_discovery_once_background,
+        args=(run_id, database_url, config),
+        daemon=True,
+        name=f"usstock-discovery-once-{run_id}",
+    )
+    thread.start()
+    return run_id
+
+
+def run_discovery_once_background(
+    run_id: str,
+    database_url: str,
+    config: DiscoveryRunConfig,
+) -> None:
+    try:
+        result = run_discovery_daily(
+            database_url,
+            config,
+            progress_callback=DISCOVERY_PROGRESS.progress_callback(run_id),
+        )
+        DISCOVERY_PROGRESS.finish(
+            run_id,
+            status="success",
+            message=format_discovery_result_message(result),
+            result=discovery_result_summary(result),
+        )
+    except Exception as exc:  # pragma: no cover - background safety net.
+        traceback.print_exc()
+        DISCOVERY_PROGRESS.finish(
+            run_id,
+            status="fail",
+            message=f"自动发现失败：{exc}",
+            error=exc,
+        )
 
 
 def upsert_stock(database_url: str | None, form: Mapping[str, list[str]]) -> str:
@@ -2560,6 +3509,95 @@ def render_candidate_scores_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def render_candidate_performance_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无复盘记录。先导入日线价格，再运行日报复盘。")
+
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td>{fmt(row.get("run_date"))}<div class="subtle">{e(row.get("profile"))}</div></td>
+              <td><strong>{e(row.get("ticker"))}</strong><div class="subtle">{e(row.get("company_name"))}</div></td>
+              <td>{fmt(row.get("rank"))}</td>
+              <td>{fmt(row.get("score"))}</td>
+              <td>{e(row.get("attention_label"))}<div class="subtle">{e(row.get("primary_topic_slug"))}</div></td>
+              <td>{fmt(row.get("entry_date"))}<div class="subtle">{fmt(row.get("entry_close"))}</div></td>
+              <td>{format_percent_value(row.get("return_1d_pct"))}</td>
+              <td>{format_percent_value(row.get("return_5d_pct"))}</td>
+              <td>{format_percent_value(row.get("max_drawdown_5d_pct"))}</td>
+              <td>{format_percent_value(row.get("return_20d_pct"))}</td>
+              <td>{render_performance_status(row.get("performance_status"))}<div class="subtle">{e(row.get("missing_reason"))}</div></td>
+              <td>{fmt(row.get("computed_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>日报</th><th>ticker</th><th>排名</th><th>分数</th>"
+            "<th>关注/主题</th><th>入场参考</th><th>T+1</th><th>T+5</th>"
+            "<th>T+5 回撤</th><th>T+20</th><th>状态</th><th>计算时间</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_market_daily_prices_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return empty_state("暂无日线价格。可以从 CSV 导入 market_daily_prices。")
+
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td><strong>{e(row.get("ticker"))}</strong></td>
+              <td>{fmt(row.get("price_date"))}</td>
+              <td>{fmt(row.get("open_price"))}</td>
+              <td>{fmt(row.get("high_price"))}</td>
+              <td>{fmt(row.get("low_price"))}</td>
+              <td>{fmt(row.get("close_price"))}</td>
+              <td>{fmt(row.get("adjusted_close_price"))}</td>
+              <td>{fmt(row.get("volume"))}</td>
+              <td>{e(row.get("data_source"))}</td>
+              <td>{fmt(row.get("updated_at"))}</td>
+            </tr>
+            """
+        )
+    return table(
+        (
+            "<tr><th>ticker</th><th>日期</th><th>开盘</th><th>最高</th>"
+            "<th>最低</th><th>收盘</th><th>复权收盘</th><th>成交量</th>"
+            "<th>来源</th><th>更新时间</th></tr>"
+        ),
+        "".join(body),
+    )
+
+
+def render_performance_status(status: Any) -> str:
+    text = str(status or "pending")
+    if text == "complete":
+        return '<span class="badge ok">完整</span>'
+    if text == "partial":
+        return '<span class="badge watch">部分</span>'
+    if text in {"no_entry_price", "no_horizon_price"}:
+        return '<span class="badge error">缺价格</span>'
+    if text == "pending":
+        return '<span class="badge muted">待计算</span>'
+    return f'<span class="badge muted">{e(text)}</span>'
+
+
+def format_percent_value(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        decimal = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return e(value)
+    return f"{decimal.quantize(Decimal('0.0001'))}%"
+
+
 def render_reports_table(
     rows: list[dict[str, Any]],
     *,
@@ -2623,9 +3661,227 @@ def render_selected_report(row: dict[str, Any]) -> str:
           {candidate_hint}
         </div>
       </div>
-      <pre class="report-preview">{e(markdown)}</pre>
+      <div class="report-preview">{render_markdown_preview_html(markdown)}</div>
     </section>
     """
+
+
+def render_markdown_preview_html(markdown: str) -> str:
+    lines = markdown.splitlines()
+    parts: list[str] = []
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        line = raw_line.strip()
+        if not line:
+            index += 1
+            continue
+
+        if line.startswith("```"):
+            code_lines: list[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                code_lines.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            code = e("\n".join(code_lines))
+            parts.append(f'<pre class="report-code"><code>{code}</code></pre>')
+            continue
+
+        if is_markdown_table_start(lines, index):
+            table_html, index = render_markdown_table_html(lines, index)
+            parts.append(table_html)
+            continue
+
+        heading_level = markdown_heading_level(line)
+        if heading_level:
+            tag = f"h{min(heading_level + 2, 6)}"
+            text = line[heading_level:].strip()
+            parts.append(f"<{tag}>{render_inline_markdown(text)}</{tag}>")
+            index += 1
+            continue
+
+        if line.startswith(">"):
+            quote_lines: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith(">"):
+                quote_lines.append(lines[index].strip().lstrip(">").strip())
+                index += 1
+            quote = "<br>".join(render_inline_markdown(item) for item in quote_lines)
+            parts.append(f"<blockquote>{quote}</blockquote>")
+            continue
+
+        if is_markdown_list_line(raw_line):
+            list_items: list[tuple[int, str]] = []
+            while index < len(lines) and is_markdown_list_line(lines[index]):
+                item_line = lines[index]
+                stripped = item_line.lstrip()
+                indent = len(item_line) - len(stripped)
+                list_items.append((indent // 2, stripped[2:].strip()))
+                index += 1
+            parts.append(render_markdown_list_html(list_items))
+            continue
+
+        paragraph_lines = [line]
+        index += 1
+        while index < len(lines):
+            next_raw = lines[index]
+            next_line = next_raw.strip()
+            if (
+                not next_line
+                or next_line.startswith("```")
+                or markdown_heading_level(next_line)
+                or next_line.startswith(">")
+                or is_markdown_list_line(next_raw)
+                or is_markdown_table_start(lines, index)
+            ):
+                break
+            paragraph_lines.append(next_line)
+            index += 1
+        paragraph = " ".join(paragraph_lines)
+        parts.append(f"<p>{render_inline_markdown(paragraph)}</p>")
+
+    return "\n".join(parts) or '<div class="empty">报告正文为空。</div>'
+
+
+def markdown_heading_level(line: str) -> int:
+    level = len(line) - len(line.lstrip("#"))
+    if 1 <= level <= 6 and len(line) > level and line[level].isspace():
+        return level
+    return 0
+
+
+def is_markdown_list_line(line: str) -> bool:
+    stripped = line.lstrip()
+    return len(stripped) > 2 and stripped[:2] in {"- ", "* "}
+
+
+def render_markdown_list_html(items: list[tuple[int, str]]) -> str:
+    if not items:
+        return ""
+    lines = ['<ul class="report-list">']
+    for depth, text in items:
+        normalized_depth = min(max(depth, 0), 3)
+        lines.append(
+            f'<li class="depth-{normalized_depth}">{render_inline_markdown(text)}</li>'
+        )
+    lines.append("</ul>")
+    return "\n".join(lines)
+
+
+def is_markdown_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    header = lines[index].strip()
+    divider = split_markdown_table_row(lines[index + 1])
+    return "|" in header and bool(divider) and all(is_markdown_table_divider(cell) for cell in divider)
+
+
+def is_markdown_table_divider(cell: str) -> bool:
+    marker = cell.strip()
+    if not marker:
+        return False
+    without_colons = marker.replace(":", "")
+    return len(without_colons) >= 3 and set(without_colons) == {"-"}
+
+
+def render_markdown_table_html(lines: list[str], index: int) -> tuple[str, int]:
+    header = split_markdown_table_row(lines[index])
+    alignments = [
+        "right" if cell.strip().endswith(":") else "left"
+        for cell in split_markdown_table_row(lines[index + 1])
+    ]
+    index += 2
+    rows: list[list[str]] = []
+    while index < len(lines) and "|" in lines[index]:
+        row = split_markdown_table_row(lines[index])
+        if not row:
+            break
+        rows.append(row)
+        index += 1
+
+    head = "".join(
+        f'<th class="align-{alignments[column] if column < len(alignments) else "left"}">'
+        f"{render_inline_markdown(cell)}</th>"
+        for column, cell in enumerate(header)
+    )
+    body = []
+    for row in rows:
+        cells = []
+        for column, cell in enumerate(row):
+            alignment = alignments[column] if column < len(alignments) else "left"
+            cells.append(
+                f'<td class="align-{alignment}">{render_inline_markdown(cell)}</td>'
+            )
+        body.append(f"<tr>{''.join(cells)}</tr>")
+
+    html_table = (
+        '<div class="report-table-wrap">'
+        '<table class="report-markdown-table">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+    return html_table, index
+
+
+def split_markdown_table_row(row: str) -> list[str]:
+    text = row.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    cells.append("".join(current).strip())
+    return cells
+
+
+def render_inline_markdown(text: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for match in MARKDOWN_INLINE_PATTERN.finditer(text):
+        parts.append(e(text[cursor : match.start()]))
+        code_text = match.group(1)
+        link_text = match.group(2)
+        link_url = match.group(3)
+        if code_text is not None:
+            parts.append(f"<code>{e(code_text)}</code>")
+        elif link_text is not None and link_url is not None:
+            safe_url = safe_markdown_link_url(link_url)
+            label = render_inline_markdown(link_text)
+            if safe_url:
+                parts.append(
+                    f'<a href="{safe_url}" target="_blank" rel="noreferrer">{label}</a>'
+                )
+            else:
+                parts.append(label)
+        cursor = match.end()
+    parts.append(e(text[cursor:]))
+    return "".join(parts)
+
+
+def safe_markdown_link_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme in {"http", "https", "mailto"}:
+        return e(url)
+    return ""
 
 
 def format_ticker_list(value: Any) -> str:
@@ -3141,6 +4397,7 @@ def layout(
         ("/finnhub", "Finnhub", "金融新闻"),
         ("/topics", "主题", "热点与评分"),
         ("/reports", "报告", "分析输出"),
+        ("/backtest", "复盘", "日报验证"),
         ("/tasks", "同步", "数据任务"),
     ]
     nav_parts = []
@@ -3896,6 +5153,194 @@ def layout(
       font-size: 12px;
       font-weight: 650;
     }}
+    .progress-panel {{
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+      min-width: 0;
+    }}
+    .progress-heading {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      min-width: 0;
+    }}
+    .progress-heading h3 {{
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-size: 15px;
+    }}
+    .progress-heading p {{
+      margin: 0;
+      max-width: 780px;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }}
+    .progress-meta {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+      min-width: 210px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }}
+    .progress-track {{
+      position: relative;
+      overflow: hidden;
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--line);
+    }}
+    .progress-fill {{
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      transition: width 240ms ease;
+    }}
+    .progress-percent {{
+      justify-self: end;
+      margin-top: -8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+    }}
+    .stage-list {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 8px;
+    }}
+    .stage-row {{
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 9px;
+      min-height: 54px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }}
+    .stage-mark {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      background: var(--badge-muted-bg);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 760;
+    }}
+    .stage-copy {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }}
+    .stage-copy strong {{
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .stage-copy span {{
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }}
+    .stage-count {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+      white-space: nowrap;
+    }}
+    .stage-row.is-running {{
+      border-color: color-mix(in srgb, var(--primary) 42%, var(--line));
+    }}
+    .stage-row.is-running .stage-mark {{
+      background: var(--badge-watch-bg);
+      color: var(--watch);
+    }}
+    .stage-row.is-success .stage-mark {{
+      background: var(--badge-ok-bg);
+      color: var(--ok);
+    }}
+    .stage-row.is-warning .stage-mark,
+    .stage-row.is-fail .stage-mark {{
+      background: var(--notice-error-bg);
+      color: var(--error);
+    }}
+    .progress-summary {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .progress-summary span {{
+      min-height: 26px;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 12px;
+      font-weight: 650;
+    }}
+    .progress-log {{
+      display: grid;
+      gap: 7px;
+      min-width: 0;
+    }}
+    .status-history {{
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }}
+    .progress-log-title {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+    }}
+    .progress-log-row {{
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }}
+    .progress-log-row time {{
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }}
+    .progress-log-row > div {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+    .progress-log-row span {{
+      display: block;
+      overflow-wrap: anywhere;
+    }}
+    .progress-log-meta {{
+      color: var(--primary);
+      font-size: 11px;
+      font-weight: 760;
+    }}
+    .progress-log-row.log-warning span,
+    .progress-log-row.log-error span {{
+      color: var(--error);
+    }}
     .button-row {{
       display: flex;
       gap: 10px;
@@ -4169,18 +5614,111 @@ def layout(
       background: var(--badge-muted-bg);
       color: var(--muted);
     }}
+    .badge.error {{
+      background: var(--notice-error-bg);
+      color: var(--error);
+    }}
     .report-preview {{
       max-height: 680px;
       overflow: auto;
-      padding: 16px;
+      padding: 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface-soft);
       color: var(--ink);
-      white-space: pre-wrap;
       word-break: break-word;
+      font-size: 14px;
+      line-height: 1.65;
+    }}
+    .report-preview > *:first-child {{
+      margin-top: 0;
+    }}
+    .report-preview > *:last-child {{
+      margin-bottom: 0;
+    }}
+    .report-preview h3 {{
+      margin: 0 0 14px;
+      font-size: 20px;
+      line-height: 1.3;
+    }}
+    .report-preview h4 {{
+      margin: 22px 0 10px;
+      font-size: 16px;
+      line-height: 1.35;
+    }}
+    .report-preview h5,
+    .report-preview h6 {{
+      margin: 18px 0 8px;
+      font-size: 14px;
+      line-height: 1.4;
+    }}
+    .report-preview p,
+    .report-preview blockquote,
+    .report-preview .report-list,
+    .report-preview .report-table-wrap,
+    .report-preview .report-code {{
+      margin: 0 0 14px;
+    }}
+    .report-preview blockquote {{
+      padding: 10px 12px;
+      border-left: 3px solid var(--primary);
+      border-radius: 0 8px 8px 0;
+      background: var(--surface);
+      color: var(--muted);
+    }}
+    .report-preview .report-list {{
+      padding-left: 20px;
+    }}
+    .report-preview li {{
+      margin: 5px 0;
+    }}
+    .report-preview li.depth-1 {{
+      margin-left: 18px;
+      list-style-type: circle;
+    }}
+    .report-preview li.depth-2,
+    .report-preview li.depth-3 {{
+      margin-left: 36px;
+      list-style-type: square;
+    }}
+    .report-preview code {{
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--ink);
+      font-size: 0.92em;
+    }}
+    .report-preview .report-code {{
+      overflow: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      white-space: pre;
+    }}
+    .report-preview .report-table-wrap {{
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }}
+    .report-preview table {{
+      width: 100%;
+      min-width: 680px;
       font-size: 13px;
-      line-height: 1.55;
+    }}
+    .report-preview th {{
+      position: static;
+    }}
+    .report-preview th,
+    .report-preview td {{
+      padding: 8px 10px;
+    }}
+    .report-preview .align-right {{
+      text-align: right;
+    }}
+    .report-preview a {{
+      word-break: break-word;
     }}
     .empty {{
       padding: 16px;
@@ -4311,6 +5849,19 @@ def layout(
       }}
       .action-row button {{
         flex: 1 1 128px;
+      }}
+      .progress-heading {{
+        flex-direction: column;
+      }}
+      .progress-meta {{
+        justify-content: flex-start;
+        min-width: 0;
+      }}
+      .stage-list {{
+        grid-template-columns: 1fr;
+      }}
+      .progress-log-row {{
+        grid-template-columns: 64px minmax(0, 1fr);
       }}
       .form-sections {{
         grid-template-columns: 1fr;

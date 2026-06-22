@@ -18,6 +18,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from usstock.config.settings import get_settings
+from usstock.runtime_logs import log_sync_operation
 
 
 CORE_FORM_TYPES = ("8-K", "10-Q", "10-K", "S-1", "20-F", "6-K")
@@ -568,6 +569,80 @@ def get_database_url(database_url: str | None = None) -> str:
     return database_url
 
 
+def _count_log_result(count: int) -> dict[str, int]:
+    return {"count": count}
+
+
+def _company_registry_log_details(
+    *,
+    database_url: str | None = None,
+    client: SecEdgarClient | None = None,
+) -> dict[str, str]:
+    return {}
+
+
+def _submissions_log_details(
+    *,
+    cik: str,
+    ticker: str | None = None,
+    form_types: set[str] | None = None,
+    limit: int | None = None,
+    database_url: str | None = None,
+    client: SecEdgarClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "cik": cik,
+        "ticker": ticker,
+        "form_types": sorted(form_types) if form_types else None,
+        "limit": limit,
+    }
+
+
+def _company_facts_log_details(
+    *,
+    cik: str,
+    ticker: str | None = None,
+    extract_facts: bool = True,
+    fact_limit: int | None = None,
+    database_url: str | None = None,
+    client: SecEdgarClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "cik": cik,
+        "ticker": ticker,
+        "extract_facts": extract_facts,
+        "fact_limit": fact_limit,
+    }
+
+
+def _ticker_log_details(
+    *,
+    ticker: str,
+    include_company_facts: bool = False,
+    form_types: set[str] | None = None,
+    filing_limit: int | None = None,
+    fact_limit: int | None = None,
+    database_url: str | None = None,
+    client: SecEdgarClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "include_company_facts": include_company_facts,
+        "form_types": sorted(form_types) if form_types else None,
+        "filing_limit": filing_limit,
+        "fact_limit": fact_limit,
+    }
+
+
+def _ticker_log_result(result: tuple[str, int, int]) -> dict[str, Any]:
+    cik, filing_count, fact_count = result
+    return {
+        "cik": cik,
+        "filing_count": filing_count,
+        "fact_count": fact_count,
+    }
+
+
 def resolve_ticker_cik(conn: Connection, ticker: str) -> str | None:
     row = conn.execute(
         """
@@ -989,6 +1064,12 @@ def upsert_financial_facts(
     return count
 
 
+@log_sync_operation(
+    source="SEC",
+    action="sync_company_registry",
+    details_builder=_company_registry_log_details,
+    result_builder=_count_log_result,
+)
 def sync_company_registry(
     *,
     database_url: str | None = None,
@@ -1002,6 +1083,12 @@ def sync_company_registry(
         return upsert_company_registry(conn, companies)
 
 
+@log_sync_operation(
+    source="SEC",
+    action="sync_submissions",
+    details_builder=_submissions_log_details,
+    result_builder=_count_log_result,
+)
 def sync_submissions(
     *,
     cik: str,
@@ -1036,6 +1123,12 @@ def sync_submissions(
             return upsert_filings(conn, filings)
 
 
+@log_sync_operation(
+    source="SEC",
+    action="sync_company_facts",
+    details_builder=_company_facts_log_details,
+    result_builder=_count_log_result,
+)
 def sync_company_facts(
     *,
     cik: str,
@@ -1063,6 +1156,12 @@ def sync_company_facts(
             return upsert_financial_facts(conn, facts, limit=fact_limit)
 
 
+@log_sync_operation(
+    source="SEC",
+    action="sync_ticker",
+    details_builder=_ticker_log_details,
+    result_builder=_ticker_log_result,
+)
 def sync_ticker(
     *,
     ticker: str,

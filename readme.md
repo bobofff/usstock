@@ -288,7 +288,6 @@ MVP 阶段建议本地计算，不依赖 TradingView 私有接口：
 项目使用 PostgreSQL。迁移代码会按 `migrations/*.sql` 文件名顺序执行 `-- migrate:up` 段，并自动创建 `schema_migrations` 表记录已经执行过的迁移。
 
 ```bash
-docker compose up -d postgres
 .venv/bin/python -m usstock.db.migrations migrate
 .venv/bin/python -m usstock.db.migrations status
 ```
@@ -300,7 +299,7 @@ usstock migrate
 usstock status
 ```
 
-数据库连接默认读取环境变量或 `.env` 中的 `DATABASE_URL`。
+数据库连接默认读取环境变量或 `.env` 中的 `DATABASE_URL`。上服务器时直接让 `DATABASE_URL` 指向服务器已有 PostgreSQL，并确保目标数据库已经创建、连接用户具备建表和迁移权限。
 
 ### SEC EDGAR 接入
 
@@ -392,6 +391,37 @@ usstock report daily --top-n 10 --save-markdown
 ```bash
 usstock report daily --top-n 10 --use-llm --save-markdown
 ```
+
+### 日报复盘和回测
+
+日报生成后，可以把后续日线价格同步到 `market_daily_prices`，再计算日报候选股在 T+1、T+5、T+20 的实际表现。第一版默认使用“日报日之后第一个有价格的交易日收盘价”作为入场参考价，避免使用日报当天之后才知道的信息。
+
+默认使用 Stooq 免费日线 CSV 同步，适合对实时性要求不高的复盘场景：
+
+```bash
+usstock market sync-stooq --ticker AAPL --ticker NVDA --from-date 2026-06-01 --to-date 2026-06-22
+usstock market sync-stooq --from-report-candidates --from-date 2026-06-01 --to-date 2026-06-22 --top-n 10
+```
+
+如果免费接口临时不可用，也可以导入本地 CSV 日线价格：
+
+```bash
+usstock market import-prices data/raw/prices.csv
+usstock market import-prices data/raw/NVDA.csv --ticker NVDA --data-source manual_csv
+```
+
+CSV 支持常见列名：`ticker`/`symbol`、`date`、`open`、`high`、`low`、`close`、`adj close`、`volume`、`currency`。如果没有 `ticker` 或 `symbol` 列，可以用 `--ticker` 指定。
+
+复盘一段时间内已经持久化的日报：
+
+```bash
+usstock backtest reports --from-date 2026-06-01 --to-date 2026-06-22 --top-n 10
+usstock backtest reports --from-date 2026-06-01 --to-date 2026-06-22 --price-source manual_csv
+```
+
+复盘结果会写入 `daily_candidate_performance`，并在命令行输出整体胜率、平均收益、中位收益、平均回撤，以及按排名、评分区间和主题聚合后的 T+5 表现。
+
+本地管理面板也提供同样入口：左侧进入“复盘”，或在“同步”页面切换到“日报复盘”标签，可以自动同步免费日线价格、运行日报复盘并查看最近复盘记录；CSV 导入作为备用入口保留。
 
 如果需要让它按固定间隔循环执行，可以使用：
 

@@ -9,6 +9,7 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -29,6 +30,7 @@ DEFAULT_TOP_N = 25
 DEFAULT_MAX_SEC_TICKERS = 50
 DEFAULT_SEC_FILING_LIMIT = 20
 DEFAULT_FINNHUB_CATEGORIES = ("general", "merger")
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 STOPWORDS = {
     "about",
@@ -194,6 +196,15 @@ class DailyDiscoveryResult:
     candidates: tuple[CandidateScore, ...]
     warnings: tuple[str, ...]
     stats: dict[str, Any]
+
+
+def emit_progress(
+    progress_callback: ProgressCallback | None,
+    **event: Any,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(event)
 
 
 DEFAULT_MARKET_TOPICS = (
@@ -730,17 +741,46 @@ def maybe_sync_finnhub_market(
     categories: tuple[str, ...],
     incremental: bool,
     warnings: list[str],
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
+    total = len(categories)
+    warning_count = len(warnings)
+    emit_progress(
+        progress_callback,
+        stage="finnhub",
+        status="running",
+        completed=0,
+        total=total,
+        message="开始同步 Finnhub market news。",
+    )
     try:
         client = finnhub.make_finnhub_client()
     except Exception as exc:
         warnings.append(f"Finnhub market news 未同步: {exc}")
+        emit_progress(
+            progress_callback,
+            stage="finnhub",
+            status="warning",
+            completed=0,
+            total=total,
+            detail=str(exc),
+            message=f"Finnhub market news 未同步：{exc}",
+        )
         return counts
 
     with psycopg.connect(database_url, autocommit=True) as conn:
-        for category in categories:
+        for index, category in enumerate(categories, start=1):
             min_id = fetch_latest_finnhub_market_id(conn, category) if incremental else None
+            emit_progress(
+                progress_callback,
+                stage="finnhub",
+                status="running",
+                completed=index - 1,
+                total=total,
+                detail=f"category={category}",
+                message=f"Finnhub {category} 同步中。",
+            )
             try:
                 counts[category] = finnhub.sync_market_news(
                     category=category,
@@ -748,8 +788,36 @@ def maybe_sync_finnhub_market(
                     database_url=database_url,
                     client=client,
                 )
+                emit_progress(
+                    progress_callback,
+                    stage="finnhub",
+                    status="running",
+                    completed=index,
+                    total=total,
+                    detail=f"{category}: {counts[category]} 条",
+                    message=f"Finnhub {category} 完成：{counts[category]} 条。",
+                )
             except Exception as exc:
                 warnings.append(f"Finnhub category={category} 同步失败: {exc}")
+                emit_progress(
+                    progress_callback,
+                    stage="finnhub",
+                    status="running",
+                    completed=index,
+                    total=total,
+                    detail=f"{category}: 失败",
+                    message=f"Finnhub {category} 同步失败：{exc}",
+                )
+    status = "warning" if len(warnings) > warning_count else "success"
+    emit_progress(
+        progress_callback,
+        stage="finnhub",
+        status=status,
+        completed=total,
+        total=total,
+        detail=f"完成 {sum(counts.values())} 条",
+        message=f"Finnhub market news 同步完成：{sum(counts.values())} 条。",
+    )
     return counts
 
 
@@ -760,15 +828,44 @@ def maybe_sync_gdelt_topics(
     timespan: str,
     max_records: int,
     warnings: list[str],
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = {}
+    total = len(topics)
+    warning_count = len(warnings)
+    emit_progress(
+        progress_callback,
+        stage="gdelt",
+        status="running",
+        completed=0,
+        total=total,
+        message=f"开始同步 GDELT 主题新闻：{total} 个主题。",
+    )
     try:
         client = gdelt.make_gdelt_client()
     except Exception as exc:
         warnings.append(f"GDELT 未同步: {exc}")
+        emit_progress(
+            progress_callback,
+            stage="gdelt",
+            status="warning",
+            completed=0,
+            total=total,
+            detail=str(exc),
+            message=f"GDELT 未同步：{exc}",
+        )
         return counts
 
-    for topic in topics:
+    for index, topic in enumerate(topics, start=1):
+        emit_progress(
+            progress_callback,
+            stage="gdelt",
+            status="running",
+            completed=index - 1,
+            total=total,
+            detail=topic.topic_slug,
+            message=f"GDELT {topic.topic_name} 同步中。",
+        )
         try:
             article_count = gdelt.sync_articles(
                 query=topic.gdelt_query,
@@ -787,8 +884,47 @@ def maybe_sync_gdelt_topics(
                 "articles": article_count,
                 "timeline": timeline_count,
             }
+            emit_progress(
+                progress_callback,
+                stage="gdelt",
+                status="running",
+                completed=index,
+                total=total,
+                detail=(
+                    f"{topic.topic_slug}: article={article_count}, "
+                    f"timeline={timeline_count}"
+                ),
+                message=(
+                    f"GDELT {topic.topic_name} 完成："
+                    f"article={article_count}，timeline={timeline_count}。"
+                ),
+            )
         except Exception as exc:
             warnings.append(f"GDELT topic={topic.topic_slug} 同步失败: {exc}")
+            emit_progress(
+                progress_callback,
+                stage="gdelt",
+                status="running",
+                completed=index,
+                total=total,
+                detail=f"{topic.topic_slug}: 失败",
+                message=f"GDELT {topic.topic_name} 同步失败：{exc}",
+            )
+    status = "warning" if len(warnings) > warning_count else "success"
+    article_total = sum(item.get("articles", 0) for item in counts.values())
+    timeline_total = sum(item.get("timeline", 0) for item in counts.values())
+    emit_progress(
+        progress_callback,
+        stage="gdelt",
+        status=status,
+        completed=total,
+        total=total,
+        detail=f"article={article_total}, timeline={timeline_total}",
+        message=(
+            "GDELT 主题新闻同步完成："
+            f"article={article_total}，timeline={timeline_total}。"
+        ),
+    )
     return counts
 
 
@@ -800,17 +936,54 @@ def maybe_sync_sec_filings(
     include_company_facts: bool,
     fact_limit: int | None,
     warnings: list[str],
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, dict[str, int | str]]:
     counts: dict[str, dict[str, int | str]] = {}
+    total = len(tickers)
+    warning_count = len(warnings)
+    emit_progress(
+        progress_callback,
+        stage="sec",
+        status="running",
+        completed=0,
+        total=total,
+        message=f"开始同步 SEC filings：{total} 个标的。",
+    )
     if not tickers:
+        emit_progress(
+            progress_callback,
+            stage="sec",
+            status="skipped",
+            completed=0,
+            total=0,
+            message="没有可扫描的 SEC 标的，已跳过。",
+        )
         return counts
     try:
         client = sec.make_sec_client()
     except Exception as exc:
         warnings.append(f"SEC filings 未同步: {exc}")
+        emit_progress(
+            progress_callback,
+            stage="sec",
+            status="warning",
+            completed=0,
+            total=total,
+            detail=str(exc),
+            message=f"SEC filings 未同步：{exc}",
+        )
         return counts
 
-    for ticker in tickers:
+    for index, ticker in enumerate(tickers, start=1):
+        emit_progress(
+            progress_callback,
+            stage="sec",
+            status="running",
+            completed=index - 1,
+            total=total,
+            detail=ticker,
+            message=f"SEC {ticker} 同步中。",
+        )
         try:
             cik, filing_count, fact_count = sec.sync_ticker(
                 ticker=ticker,
@@ -825,8 +998,44 @@ def maybe_sync_sec_filings(
                 "filings": filing_count,
                 "facts": fact_count,
             }
+            emit_progress(
+                progress_callback,
+                stage="sec",
+                status="running",
+                completed=index,
+                total=total,
+                detail=f"{ticker}: filing={filing_count}, fact={fact_count}",
+                message=(
+                    f"SEC {ticker} 完成："
+                    f"filing={filing_count}，fact={fact_count}。"
+                ),
+            )
         except Exception as exc:
             warnings.append(f"SEC ticker={ticker} 同步失败: {exc}")
+            emit_progress(
+                progress_callback,
+                stage="sec",
+                status="running",
+                completed=index,
+                total=total,
+                detail=f"{ticker}: 失败",
+                message=f"SEC {ticker} 同步失败：{exc}",
+            )
+    status = "warning" if len(warnings) > warning_count else "success"
+    filing_total = sum(int(item.get("filings", 0)) for item in counts.values())
+    fact_total = sum(int(item.get("facts", 0)) for item in counts.values())
+    emit_progress(
+        progress_callback,
+        stage="sec",
+        status=status,
+        completed=total,
+        total=total,
+        detail=f"filing={filing_total}, fact={fact_total}",
+        message=(
+            "SEC filings 同步完成："
+            f"filing={filing_total}，fact={fact_total}。"
+        ),
+    )
     return counts
 
 
@@ -1499,20 +1708,60 @@ def run_daily_discovery(
     skip_gdelt_sync: bool = False,
     skip_sec_sync: bool = False,
     top_n: int = DEFAULT_TOP_N,
+    progress_callback: ProgressCallback | None = None,
 ) -> DailyDiscoveryResult:
     database_url = get_database_url(database_url)
     run_date = run_date or date.today()
     warnings: list[str] = []
-    stats: dict[str, Any] = {
-        "migrations_applied": ensure_discovery_schema(database_url),
-    }
+    stats: dict[str, Any] = {}
+
+    emit_progress(
+        progress_callback,
+        stage="prepare",
+        status="running",
+        completed=0,
+        total=3,
+        message="开始准备数据库结构。",
+    )
+    stats["migrations_applied"] = ensure_discovery_schema(database_url)
+    emit_progress(
+        progress_callback,
+        stage="prepare",
+        status="running",
+        completed=1,
+        total=3,
+        detail=f"migrations={stats['migrations_applied']}",
+        message=f"数据库结构检查完成：应用迁移 {stats['migrations_applied']} 个。",
+    )
 
     with psycopg.connect(database_url, autocommit=False) as conn:
         with conn.transaction():
             stats["seed_topics"] = upsert_market_topics(conn, DEFAULT_MARKET_TOPICS)
+        emit_progress(
+            progress_callback,
+            stage="prepare",
+            status="running",
+            completed=2,
+            total=3,
+            detail=f"seed_topics={stats['seed_topics']}",
+            message=f"默认主题准备完成：写入或刷新 {stats['seed_topics']} 个。",
+        )
         topics = fetch_active_topics(conn)
         universe = fetch_stock_universe(conn)
         sec_scan_tickers = fetch_sec_scan_tickers(conn, max_sec_tickers)
+    emit_progress(
+        progress_callback,
+        stage="prepare",
+        status="success",
+        completed=3,
+        total=3,
+        detail=f"topics={len(topics)}, universe={len(universe)}, sec={len(sec_scan_tickers)}",
+        message=(
+            "基础数据准备完成："
+            f"主题 {len(topics)} 个，股票池 {len(universe)} 个，"
+            f"SEC 扫描 {len(sec_scan_tickers)} 个标的。"
+        ),
+    )
 
     if not skip_finnhub_sync:
         stats["finnhub_sync"] = maybe_sync_finnhub_market(
@@ -1520,6 +1769,16 @@ def run_daily_discovery(
             categories=finnhub_categories,
             incremental=incremental_finnhub,
             warnings=warnings,
+            progress_callback=progress_callback,
+        )
+    else:
+        emit_progress(
+            progress_callback,
+            stage="finnhub",
+            status="skipped",
+            completed=0,
+            total=0,
+            message="已按参数跳过 Finnhub 新闻同步。",
         )
     if not skip_gdelt_sync:
         stats["gdelt_sync"] = maybe_sync_gdelt_topics(
@@ -1528,6 +1787,16 @@ def run_daily_discovery(
             timespan=gdelt_timespan,
             max_records=gdelt_max_records,
             warnings=warnings,
+            progress_callback=progress_callback,
+        )
+    else:
+        emit_progress(
+            progress_callback,
+            stage="gdelt",
+            status="skipped",
+            completed=0,
+            total=0,
+            message="已按参数跳过 GDELT 主题新闻同步。",
         )
     if not skip_sec_sync:
         stats["sec_sync"] = maybe_sync_sec_filings(
@@ -1537,12 +1806,30 @@ def run_daily_discovery(
             include_company_facts=include_company_facts,
             fact_limit=fact_limit,
             warnings=warnings,
+            progress_callback=progress_callback,
+        )
+    else:
+        emit_progress(
+            progress_callback,
+            stage="sec",
+            status="skipped",
+            completed=0,
+            total=0,
+            message="已按参数跳过 SEC filings 同步。",
         )
 
     lookback_days = max(1, (lookback_hours + 23) // 24)
     candidates: dict[str, CandidateAccumulator] = {}
     mentions: list[TopicMention] = []
 
+    emit_progress(
+        progress_callback,
+        stage="scoring",
+        status="running",
+        completed=0,
+        total=4,
+        message="开始读取近期数据并匹配主题。",
+    )
     with psycopg.connect(database_url, autocommit=False) as conn:
         topics = fetch_active_topics(conn)
         universe = fetch_stock_universe(conn)
@@ -1550,6 +1837,23 @@ def run_daily_discovery(
         finnhub_articles = fetch_recent_finnhub_articles(conn, lookback_hours=lookback_hours)
         gdelt_articles = fetch_recent_gdelt_articles(conn, lookback_hours=lookback_hours)
         sec_filings = fetch_recent_sec_filings(conn, lookback_days=lookback_days)
+        emit_progress(
+            progress_callback,
+            stage="scoring",
+            status="running",
+            completed=1,
+            total=4,
+            detail=(
+                f"finnhub={len(finnhub_articles)}, "
+                f"gdelt={len(gdelt_articles)}, sec={len(sec_filings)}"
+            ),
+            message=(
+                "近期数据读取完成："
+                f"Finnhub {len(finnhub_articles)} 篇，"
+                f"GDELT {len(gdelt_articles)} 篇，"
+                f"SEC {len(sec_filings)} 条。"
+            ),
+        )
 
         mentions.extend(
             build_stock_topic_mentions(
@@ -1585,8 +1889,29 @@ def run_daily_discovery(
         for ticker, fact_count in fact_counts.items():
             if ticker in candidates:
                 candidates[ticker].fact_count = fact_count
+        emit_progress(
+            progress_callback,
+            stage="scoring",
+            status="running",
+            completed=3,
+            total=4,
+            detail=f"mentions={len(mentions)}, candidates={len(candidates)}",
+            message=(
+                "主题命中匹配完成："
+                f"提及 {len(mentions)} 条，候选标的 {len(candidates)} 个。"
+            ),
+        )
 
         scores = rank_candidates(candidates, run_date=run_date, top_n=top_n)
+        emit_progress(
+            progress_callback,
+            stage="scoring",
+            status="success",
+            completed=4,
+            total=4,
+            detail=f"ranked={len(scores)}",
+            message=f"候选评分完成：入选 {len(scores)} 个。",
+        )
         stats.update(
             {
                 "active_topics": len(topics),
@@ -1606,10 +1931,45 @@ def run_daily_discovery(
             stats=stats,
         )
 
+        emit_progress(
+            progress_callback,
+            stage="persist",
+            status="running",
+            completed=0,
+            total=3,
+            message="开始保存主题提及、候选评分和观察列表。",
+        )
         with conn.transaction():
             upsert_topic_mentions(conn, mentions)
+            emit_progress(
+                progress_callback,
+                stage="persist",
+                status="running",
+                completed=1,
+                total=3,
+                detail=f"mentions={len(mentions)}",
+                message=f"主题提及保存完成：{len(mentions)} 条。",
+            )
             upsert_candidate_scores(conn, scores)
+            emit_progress(
+                progress_callback,
+                stage="persist",
+                status="running",
+                completed=2,
+                total=3,
+                detail=f"candidates={len(scores)}",
+                message=f"候选评分保存完成：{len(scores)} 个。",
+            )
             upsert_daily_watchlist(conn, result)
+        emit_progress(
+            progress_callback,
+            stage="persist",
+            status="success",
+            completed=3,
+            total=3,
+            detail=f"warnings={len(warnings)}",
+            message=f"自动发现结果保存完成：警告 {len(warnings)} 条。",
+        )
 
     return result
 

@@ -19,6 +19,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from usstock.config.settings import get_settings
+from usstock.runtime_logs import log_sync_operation
 
 
 MARKET_NEWS_ENDPOINT = "market_news"
@@ -210,6 +211,38 @@ def get_database_url(database_url: str | None = None) -> str:
     if not database_url:
         raise FinnhubError("缺少 DATABASE_URL，请在环境变量或 .env 中配置。")
     return database_url
+
+
+def _count_log_result(count: int) -> dict[str, int]:
+    return {"count": count}
+
+
+def _market_news_log_details(
+    *,
+    category: str = DEFAULT_MARKET_CATEGORY,
+    min_id: int | None = None,
+    database_url: str | None = None,
+    client: FinnhubClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "category": category,
+        "min_id": min_id,
+    }
+
+
+def _company_news_log_details(
+    *,
+    ticker: str,
+    from_date: date | str | None = None,
+    to_date: date | str | None = None,
+    database_url: str | None = None,
+    client: FinnhubClient | None = None,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "from_date": from_date,
+        "to_date": to_date,
+    }
 
 
 def normalize_category(category: str | None) -> str:
@@ -521,6 +554,12 @@ def upsert_articles(conn: Connection, articles: list[FinnhubArticle]) -> int:
     return count
 
 
+@log_sync_operation(
+    source="Finnhub",
+    action="sync_market_news",
+    details_builder=_market_news_log_details,
+    result_builder=_count_log_result,
+)
 def sync_market_news(
     *,
     category: str = DEFAULT_MARKET_CATEGORY,
@@ -567,6 +606,12 @@ def sync_market_news(
             return upsert_articles(conn, articles)
 
 
+@log_sync_operation(
+    source="Finnhub",
+    action="sync_company_news",
+    details_builder=_company_news_log_details,
+    result_builder=_count_log_result,
+)
 def sync_company_news(
     *,
     ticker: str,
