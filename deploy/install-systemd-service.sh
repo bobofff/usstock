@@ -37,8 +37,10 @@ After=network.target postgresql.service
 [Service]
 Type=simple
 WorkingDirectory=${PROJECT_DIR}
+Environment=USSTOCK_ADMIN_HOST=${HOST}
+Environment=USSTOCK_ADMIN_PORT=${PORT}
 EnvironmentFile=${PROJECT_DIR}/.env
-ExecStart=${PROJECT_DIR}/.venv/bin/usstock admin --host ${HOST} --port ${PORT}
+ExecStart=${PROJECT_DIR}/.venv/bin/usstock admin --host \${USSTOCK_ADMIN_HOST} --port \${USSTOCK_ADMIN_PORT}
 Restart=always
 RestartSec=5
 User=${SERVICE_USER}
