@@ -7,6 +7,7 @@ from usstock.admin.app import (
     render_backtest_forms,
     render_markdown_preview_html,
     render_selected_report,
+    table,
 )
 
 
@@ -69,6 +70,20 @@ class AdminReportPreviewTest(unittest.TestCase):
         self.assertIn("自动同步日线价格", html)
         self.assertIn("从日报候选自动提取 ticker", html)
         self.assertIn("value=\"stooq\"", html)
+
+    def test_table_includes_page_size_selector(self) -> None:
+        html = table(
+            "<tr><th>ticker</th></tr>",
+            "<tr><td>AAPL</td></tr>",
+            page_size=50,
+        )
+
+        self.assertIn('data-page-size="50"', html)
+        self.assertIn('data-page-size-select', html)
+        self.assertIn('<option value="10">10</option>', html)
+        self.assertIn('<option value="20">20</option>', html)
+        self.assertIn('<option value="50" selected>50</option>', html)
+        self.assertIn('<option value="100">100</option>', html)
 
 
 if __name__ == "__main__":

@@ -37,8 +37,9 @@ from usstock.reports import daily_report
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 60
-PAGE_SIZE = 100
-TABLE_PAGE_SIZE = 15
+TABLE_PAGE_SIZE = 20
+TABLE_PAGE_SIZE_OPTIONS = (10, 20, 50, 100)
+TOPIC_CLOUD_ROW_LIMIT = 100
 MAX_POST_BYTES = 64 * 1024
 TOPIC_CLOUD_SIZE = 420
 TOPIC_CLOUD_RADIUS = 186
@@ -1104,7 +1105,7 @@ def render_dashboard(
                              mt.priority, mt.topic_slug
                     LIMIT %s
                     """,
-                    (PAGE_SIZE,),
+                    (TOPIC_CLOUD_ROW_LIMIT,),
                 )
             elif tables["market_topics"]:
                 topic_cloud_rows = fetch_all(
@@ -1117,7 +1118,7 @@ def render_dashboard(
                     ORDER BY is_active DESC, priority, topic_slug
                     LIMIT %s
                     """,
-                    (PAGE_SIZE,),
+                    (TOPIC_CLOUD_ROW_LIMIT,),
                 )
             else:
                 topic_cloud_rows = []
@@ -1142,7 +1143,7 @@ def render_dashboard(
                         last_seen_at DESC
                     LIMIT %s
                     """,
-                    (PAGE_SIZE,),
+                    (TOPIC_CLOUD_ROW_LIMIT,),
                 )
                 if tables["market_topic_candidates"]
                 else []
@@ -1319,9 +1320,8 @@ def render_stocks(
                     FROM stock_universe
                     {where}
                     ORDER BY is_manual_watchlist DESC, is_active DESC, ticker
-                    LIMIT %s
                     """,
-                    (*params, PAGE_SIZE),
+                    tuple(params),
                 )
     except Exception as exc:
         return render_database_error(exc, active="/stocks")
@@ -1389,9 +1389,8 @@ def render_sec_filings(
                     FROM sec_filings
                     {where}
                     ORDER BY filing_date DESC, acceptance_datetime DESC NULLS LAST
-                    LIMIT %s
                     """,
-                    (*params, PAGE_SIZE),
+                    tuple(params),
                 )
     except Exception as exc:
         return render_database_error(exc, active="/sec")
@@ -1456,9 +1455,8 @@ def render_gdelt(
                     FROM gdelt_articles
                     {article_where}
                     ORDER BY coalesce(seen_at, last_seen_at) DESC
-                    LIMIT %s
                     """,
-                    (*article_params, PAGE_SIZE),
+                    tuple(article_params),
                 )
                 if has_articles
                 else []
@@ -1471,7 +1469,6 @@ def render_gdelt(
                     FROM gdelt_doc_queries
                     {query_where}
                     ORDER BY fetched_at DESC
-                    LIMIT 20
                     """,
                     tuple(query_params),
                 )
@@ -1611,9 +1608,8 @@ def render_finnhub(
                     FROM finnhub_articles
                     {article_where}
                     ORDER BY coalesce(published_at, last_seen_at) DESC
-                    LIMIT %s
                     """,
-                    (*article_params, PAGE_SIZE),
+                    tuple(article_params),
                 )
                 if has_articles
                 else []
@@ -1627,7 +1623,6 @@ def render_finnhub(
                     FROM finnhub_news_queries
                     {query_where}
                     ORDER BY fetched_at DESC
-                    LIMIT 20
                     """,
                     tuple(query_params),
                 )
@@ -1869,9 +1864,7 @@ def render_topics(
                              mt.keywords, mt.ticker_hints, mt.priority,
                              mt.is_active, mt.last_refreshed_at
                     ORDER BY mt.is_active DESC, mt.priority, mt.topic_slug
-                    LIMIT %s
                     """,
-                    (PAGE_SIZE,),
                 )
             elif has_topics:
                 topic_rows = fetch_all(
@@ -1892,9 +1885,7 @@ def render_topics(
                         NULL AS last_detected_at
                     FROM market_topics
                     ORDER BY is_active DESC, priority, topic_slug
-                    LIMIT %s
                     """,
-                    (PAGE_SIZE,),
                 )
             else:
                 topic_rows = []
@@ -1941,9 +1932,8 @@ def render_topics(
                         END,
                         trend_score DESC,
                         last_seen_at DESC
-                    LIMIT %s
                     """,
-                    (*candidate_params, PAGE_SIZE),
+                    tuple(candidate_params),
                 )
                 if has_topic_candidates
                 else []
@@ -1971,9 +1961,8 @@ def render_topics(
                     FROM topic_mentions
                     {mention_where}
                     ORDER BY detected_at DESC
-                    LIMIT %s
                     """,
-                    (*mention_params, PAGE_SIZE),
+                    tuple(mention_params),
                 )
                 if has_mentions
                 else []
@@ -2001,9 +1990,8 @@ def render_topics(
                     FROM daily_candidate_scores
                     {score_where}
                     ORDER BY run_date DESC, rank NULLS LAST, score DESC
-                    LIMIT %s
                     """,
-                    (*score_params, PAGE_SIZE),
+                    tuple(score_params),
                 )
                 if has_scores
                 else []
@@ -2138,9 +2126,7 @@ def render_reports(
                            llm_used, llm_model, summary, generated_at
                     FROM daily_analysis_reports
                     ORDER BY generated_at DESC
-                    LIMIT %s
                     """,
-                    (PAGE_SIZE,),
                 )
                 if has_reports
                 else []
@@ -2315,9 +2301,7 @@ def render_backtest_workspace(
                            performance_status, missing_reason, computed_at
                     FROM daily_candidate_performance
                     ORDER BY computed_at DESC, run_date DESC, rank NULLS LAST, ticker
-                    LIMIT %s
                     """,
-                    (PAGE_SIZE,),
                 )
                 if has_performance
                 else []
@@ -4317,14 +4301,27 @@ def render_migrations_table(rows: list[dict[str, Any]]) -> str:
 
 
 def table(head: str, body: str, *, page_size: int = TABLE_PAGE_SIZE) -> str:
+    resolved_page_size = (
+        page_size if page_size in TABLE_PAGE_SIZE_OPTIONS else TABLE_PAGE_SIZE
+    )
+    page_size_options = "".join(
+        (
+            f'<option value="{option}"'
+            f'{" selected" if option == resolved_page_size else ""}>{option}</option>'
+        )
+        for option in TABLE_PAGE_SIZE_OPTIONS
+    )
     return (
         '<div class="table-panel" data-table-panel '
-        f'data-page-size="{page_size}"><div class="table-wrap">'
+        f'data-page-size="{resolved_page_size}"><div class="table-wrap">'
         f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
         "</div>"
         '<div class="table-pagination" data-pagination hidden>'
         '<span class="table-page-info" data-page-info></span>'
         '<div class="table-page-actions">'
+        '<label class="table-page-size-control">每页 '
+        f'<select data-page-size-select aria-label="每页条数">{page_size_options}</select>'
+        "</label>"
         '<button type="button" data-page-prev aria-label="上一页">上一页</button>'
         '<button type="button" data-page-next aria-label="下一页">下一页</button>'
         "</div>"
@@ -4465,16 +4462,21 @@ def layout(
           const rows = Array.from(panel.querySelectorAll("tbody tr"));
           const controls = panel.querySelector("[data-pagination]");
           const info = panel.querySelector("[data-page-info]");
+          const pageSizeSelect = panel.querySelector("[data-page-size-select]");
           const prev = panel.querySelector("[data-page-prev]");
           const next = panel.querySelector("[data-page-next]");
           if (!controls || !info || !prev || !next || rows.length === 0) {{
             return;
           }}
 
-          const parsedPageSize = Number.parseInt(panel.dataset.pageSize || "{TABLE_PAGE_SIZE}", 10);
-          const pageSize = Number.isFinite(parsedPageSize) && parsedPageSize > 0
-            ? parsedPageSize
-            : {TABLE_PAGE_SIZE};
+          const allowedPageSizes = {list(TABLE_PAGE_SIZE_OPTIONS)};
+          const fallbackPageSize = {TABLE_PAGE_SIZE};
+          const smallestPageSize = Math.min(...allowedPageSizes);
+          const parsePageSize = (value) => {{
+            const parsed = Number.parseInt(value || String(fallbackPageSize), 10);
+            return allowedPageSizes.includes(parsed) ? parsed : fallbackPageSize;
+          }};
+          let pageSize = parsePageSize(panel.dataset.pageSize);
           let page = 1;
 
           const render = () => {{
@@ -4485,11 +4487,21 @@ def layout(
             rows.forEach((row, index) => {{
               row.hidden = index < start || index >= end;
             }});
-            controls.hidden = rows.length <= pageSize;
+            controls.hidden = rows.length <= smallestPageSize;
             info.textContent = "第 " + page + " / " + totalPages + " 页 · 共 " + rows.length + " 条";
             prev.disabled = page <= 1;
             next.disabled = page >= totalPages;
           }};
+
+          if (pageSizeSelect) {{
+            pageSizeSelect.value = String(pageSize);
+            pageSizeSelect.addEventListener("change", () => {{
+              pageSize = parsePageSize(pageSizeSelect.value);
+              panel.dataset.pageSize = String(pageSize);
+              page = 1;
+              render();
+            }});
+          }}
 
           prev.addEventListener("click", () => {{
             page -= 1;
@@ -5551,6 +5563,23 @@ def layout(
       display: flex;
       align-items: center;
       gap: 8px;
+    }}
+    .table-page-size-control {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }}
+    .table-page-size-control select {{
+      width: auto;
+      min-width: 72px;
+      min-height: 32px;
+      margin: 0;
+      padding: 0 28px 0 10px;
+      font-size: 12px;
     }}
     .table-pagination button {{
       min-height: 32px;
