@@ -259,14 +259,67 @@ def fetch_watchlist_payload(
     return row[0], payload
 
 
+def resolve_profile_topic_slug(conn: Connection, *, profile: str) -> str | None:
+    if not profile or profile.strip().lower() == DEFAULT_PROFILE:
+        return None
+    normalized = profile.strip().lower()
+    row = conn.execute(
+        """
+        SELECT topic_slug
+        FROM market_topics
+        WHERE is_active
+          AND (
+                lower(topic_slug) = %s
+                OR lower(topic_name) = %s
+              )
+        ORDER BY CASE WHEN lower(topic_slug) = %s THEN 0 ELSE 1 END,
+                 priority,
+                 topic_slug
+        LIMIT 1
+        """,
+        (normalized, normalized, normalized),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def candidate_matches_topic(candidate: Mapping[str, Any], topic_slug: str) -> bool:
+    topics = {str(topic) for topic in (candidate.get("topics") or ()) if topic}
+    primary_topic = candidate.get("primary_topic") or candidate.get("primary_topic_slug")
+    if primary_topic:
+        topics.add(str(primary_topic))
+    return topic_slug in topics
+
+
+def filter_candidate_payloads_by_topic(
+    candidate_payloads: list[dict[str, Any]],
+    *,
+    topic_slug: str | None,
+) -> list[dict[str, Any]]:
+    if not topic_slug:
+        return candidate_payloads
+    return [
+        candidate
+        for candidate in candidate_payloads
+        if candidate_matches_topic(candidate, topic_slug)
+    ]
+
+
 def fetch_candidate_score_payloads(
     conn: Connection,
     *,
     run_date: date,
     top_n: int,
+    topic_slug: str | None = None,
 ) -> list[dict[str, Any]]:
+    topic_filter = ""
+    params: list[Any] = [run_date]
+    if topic_slug:
+        topic_filter = "AND %s = ANY(topic_slugs)"
+        params.append(topic_slug)
+    params.append(top_n)
+
     rows = conn.execute(
-        """
+        f"""
         SELECT rank, ticker, company_name, score, action_bias, topic_slugs,
                primary_topic_slug, news_score, gdelt_score, sec_score,
                fundamental_score, liquidity_score, finnhub_article_count,
@@ -274,10 +327,11 @@ def fetch_candidate_score_payloads(
                latest_filing_date, rationale
         FROM daily_candidate_scores
         WHERE run_date = %s
+          {topic_filter}
         ORDER BY rank NULLS LAST, score DESC, ticker
         LIMIT %s
         """,
-        (run_date, top_n),
+        tuple(params),
     ).fetchall()
     payloads: list[dict[str, Any]] = []
     for row in rows:
@@ -384,19 +438,49 @@ def load_report_context(
     run_date: date,
     profile: str,
     top_n: int,
-) -> tuple[str | None, list[dict[str, Any]], dict[str, str], dict[str, tuple[SourceEvidence, ...]]]:
+) -> tuple[
+    str | None,
+    list[dict[str, Any]],
+    dict[str, str],
+    dict[str, tuple[SourceEvidence, ...]],
+    tuple[str, ...],
+]:
+    warnings: list[str] = []
+    profile_topic_slug = resolve_profile_topic_slug(conn, profile=profile)
     source_watchlist_uid, watchlist_payload = fetch_watchlist_payload(
         conn,
         run_date=run_date,
         profile=profile,
     )
     if watchlist_payload and watchlist_payload.get("candidates"):
-        candidate_payloads = list(watchlist_payload["candidates"][:top_n])
+        watchlist_candidates = list(watchlist_payload["candidates"])
+        topic_candidates = filter_candidate_payloads_by_topic(
+            watchlist_candidates,
+            topic_slug=profile_topic_slug,
+        )
+        if profile_topic_slug and not topic_candidates:
+            warnings.append(
+                f"profile={profile} 对应主题 {profile_topic_slug}，"
+                "但观察清单没有该主题候选，已改用候选评分表筛选。"
+            )
+            candidate_payloads = fetch_candidate_score_payloads(
+                conn,
+                run_date=run_date,
+                top_n=top_n,
+                topic_slug=profile_topic_slug,
+            )
+        else:
+            candidate_payloads = topic_candidates[:top_n]
     else:
+        if profile_topic_slug is None and profile.strip().lower() != DEFAULT_PROFILE:
+            warnings.append(
+                f"未找到 profile={profile} 的观察清单或同名启用主题，已使用全局候选评分。"
+            )
         candidate_payloads = fetch_candidate_score_payloads(
             conn,
             run_date=run_date,
             top_n=top_n,
+            topic_slug=profile_topic_slug,
         )
 
     topic_names = fetch_topic_names(conn)
@@ -421,7 +505,13 @@ def load_report_context(
         tickers=tickers,
         topics=topics,
     )
-    return source_watchlist_uid, candidate_payloads, topic_names, evidence
+    return (
+        source_watchlist_uid,
+        candidate_payloads,
+        topic_names,
+        evidence,
+        tuple(warnings),
+    )
 
 
 def classify_event_type(text: str, *, has_sec: bool) -> str:
@@ -739,6 +829,7 @@ def build_base_report(
     candidate_payloads: list[dict[str, Any]],
     topic_names: Mapping[str, str],
     evidence_by_ticker: Mapping[str, tuple[SourceEvidence, ...]],
+    warnings: tuple[str, ...] = (),
 ) -> DailyAnalysisReport:
     candidates = tuple(
         build_candidate_analysis(
@@ -763,7 +854,7 @@ def build_base_report(
         risk_overview=risk_overview,
         methodology_notes=methodology_notes,
         candidates=candidates,
-        warnings=(),
+        warnings=warnings,
         llm_used=False,
         llm_provider=None,
         llm_model=None,
@@ -1108,7 +1199,13 @@ def generate_daily_report(
     )
 
     with psycopg.connect(database_url, autocommit=False) as conn:
-        source_watchlist_uid, candidates, topic_names, evidence = load_report_context(
+        (
+            source_watchlist_uid,
+            candidates,
+            topic_names,
+            evidence,
+            warnings,
+        ) = load_report_context(
             conn,
             run_date=run_date,
             profile=profile,
@@ -1121,6 +1218,7 @@ def generate_daily_report(
             candidate_payloads=candidates,
             topic_names=topic_names,
             evidence_by_ticker=evidence,
+            warnings=warnings,
         )
         report = maybe_enhance_with_llm(report, config=config)
         if persist:

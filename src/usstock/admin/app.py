@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
+import hashlib
 import html
+import json
 import math
+import os
 import re
+import secrets
 import sys
 import threading
 import traceback
@@ -16,6 +21,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -37,6 +43,9 @@ from usstock.reports import daily_report
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7878
 DEFAULT_DISCOVERY_INTERVAL_MINUTES = 60
+ADMIN_ACTION_TOKEN_QUERY_PARAM = "admin_token"
+ADMIN_ACTION_COOKIE_NAME = "usstock_admin_action_token"
+ADMIN_AUTH_LOG_PATH = PROJECT_ROOT / "logs" / "admin_auth.log"
 TABLE_PAGE_SIZE = 20
 TABLE_PAGE_SIZE_OPTIONS = (10, 20, 50, 100)
 TOPIC_CLOUD_ROW_LIMIT = 100
@@ -468,6 +477,18 @@ class AdminPanelError(RuntimeError):
     """Raised when the local admin panel cannot complete a request."""
 
 
+@dataclass(frozen=True)
+class AdminAccess:
+    protected: bool
+    allowed: bool
+
+
+ADMIN_ACCESS_CONTEXT: contextvars.ContextVar[AdminAccess] = contextvars.ContextVar(
+    "admin_access",
+    default=AdminAccess(protected=False, allowed=True),
+)
+
+
 class AdminHTTPServer(ThreadingHTTPServer):
     """HTTP server carrying runtime settings."""
 
@@ -479,9 +500,11 @@ class AdminHTTPServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         *,
         database_url: str | None,
+        admin_action_token: str,
     ) -> None:
         super().__init__(server_address, handler_class)
         self.database_url = database_url
+        self.admin_action_token = admin_action_token
 
 
 class AdminRequestHandler(BaseHTTPRequestHandler):
@@ -491,51 +514,97 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-
-        if parsed.path == "/partials/discovery-status":
-            self.send_html(
-                HTTPStatus.OK,
-                render_discovery_scheduler_status(
-                    DISCOVERY_SCHEDULER.snapshot(),
-                    DISCOVERY_PROGRESS.snapshot(),
-                    include_oob_actions=True,
-                ),
-            )
-            return
-        if parsed.path == "/partials/discovery-progress":
-            self.send_html(
-                HTTPStatus.OK,
-                render_discovery_progress_fragment(
-                    DISCOVERY_PROGRESS.snapshot(),
-                    include_oob_actions=True,
-                ),
-            )
-            return
-
-        routes = {
-            "/": render_dashboard,
-            "/stocks": render_stocks,
-            "/sec": render_sec_filings,
-            "/gdelt": render_gdelt,
-            "/finnhub": render_finnhub,
-            "/topics": render_topics,
-            "/reports": render_reports,
-            "/backtest": render_backtest,
-            "/tasks": render_tasks,
-        }
-        renderer = routes.get(parsed.path)
-        if not renderer:
-            self.send_html(HTTPStatus.NOT_FOUND, render_not_found())
-            return
-
-        self.send_html(
-            HTTPStatus.OK,
-            renderer(
-                database_url=self.resolve_database_url(),
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        set_admin_cookie = False
+        if self.admin_query_token_was_provided(query):
+            query_token_valid = self.admin_query_token_is_valid(query)
+            self.write_admin_auth_log(
+                "get_admin_token_query",
+                {
+                    "query_token_valid": query_token_valid,
+                    "query_token_fingerprint": token_fingerprint(
+                        form_value(query, ADMIN_ACTION_TOKEN_QUERY_PARAM)
+                    ),
+                    "clean_path": self.path_without_admin_token(parsed),
+                },
+                parsed=parsed,
                 query=query,
-            ),
+            )
+            if not query_token_valid:
+                self.redirect(
+                    self.path_without_admin_token(parsed),
+                    "管理员令牌无效，已进入只读浏览。",
+                    ok=False,
+                )
+                return
+            set_admin_cookie = True
+
+        context_token = ADMIN_ACCESS_CONTEXT.set(
+            self.resolve_admin_access(query=query)
         )
+        try:
+            self.write_admin_auth_log(
+                "get_access_resolved",
+                {
+                    "protected": current_admin_access().protected,
+                    "allowed": current_admin_access().allowed,
+                    "set_admin_cookie": set_admin_cookie,
+                },
+                parsed=parsed,
+                query=query,
+            )
+            if parsed.path == "/partials/discovery-status":
+                self.send_html(
+                    HTTPStatus.OK,
+                    render_discovery_scheduler_status(
+                        DISCOVERY_SCHEDULER.snapshot(),
+                        DISCOVERY_PROGRESS.snapshot(),
+                        include_oob_actions=True,
+                    ),
+                    set_admin_cookie=set_admin_cookie,
+                )
+                return
+            if parsed.path == "/partials/discovery-progress":
+                self.send_html(
+                    HTTPStatus.OK,
+                    render_discovery_progress_fragment(
+                        DISCOVERY_PROGRESS.snapshot(),
+                        include_oob_actions=True,
+                    ),
+                    set_admin_cookie=set_admin_cookie,
+                )
+                return
+
+            routes = {
+                "/": render_dashboard,
+                "/stocks": render_stocks,
+                "/sec": render_sec_filings,
+                "/gdelt": render_gdelt,
+                "/finnhub": render_finnhub,
+                "/topics": render_topics,
+                "/reports": render_reports,
+                "/backtest": render_backtest,
+                "/tasks": render_tasks,
+            }
+            renderer = routes.get(parsed.path)
+            if not renderer:
+                self.send_html(
+                    HTTPStatus.NOT_FOUND,
+                    render_not_found(),
+                    set_admin_cookie=set_admin_cookie,
+                )
+                return
+
+            self.send_html(
+                HTTPStatus.OK,
+                renderer(
+                    database_url=self.resolve_database_url(),
+                    query=query,
+                ),
+                set_admin_cookie=set_admin_cookie,
+            )
+        finally:
+            ADMIN_ACCESS_CONTEXT.reset(context_token)
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -546,9 +615,42 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
 
         raw_bytes = self.rfile.read(length)
         raw_body = raw_bytes.decode("utf-8")
-        form = urllib.parse.parse_qs(raw_body)
+        form = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
+        context_token = ADMIN_ACCESS_CONTEXT.set(
+            self.resolve_admin_access(query=query, form=form)
+        )
         try:
+            self.write_admin_auth_log(
+                "post_access_resolved",
+                {
+                    "protected": current_admin_access().protected,
+                    "allowed": current_admin_access().allowed,
+                    "content_type": self.headers.get("Content-Type") or "",
+                    "content_length": length,
+                },
+                parsed=parsed,
+                query=query,
+                form=form,
+            )
+            if not current_admin_access().allowed:
+                self.write_admin_auth_log(
+                    "post_denied_readonly",
+                    {
+                        "fallback_path": action_fallback_path(parsed.path, form),
+                    },
+                    parsed=parsed,
+                    query=query,
+                    form=form,
+                )
+                self.redirect(
+                    action_fallback_path(parsed.path, form),
+                    "当前为只读浏览，只有管理员可以执行数据动作。",
+                    ok=False,
+                )
+                return
+
             database_url = self.resolve_database_url()
             if parsed.path == "/actions/stock-upsert":
                 message = upsert_stock(database_url, form)
@@ -730,7 +832,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 self.redirect(
                     safe_return_path(form, "/backtest"),
                     format_market_sync_result_message(result),
-                    ok=not result.failed_tickers,
+                    ok=market_sync_notice_is_ok(result),
                 )
                 return
 
@@ -861,23 +963,138 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self.redirect("/tasks", "未知操作。", ok=False)
         except Exception as exc:  # pragma: no cover - keeps the panel usable.
             traceback.print_exc()
-            fallback_path = (
-                "/topics?pane=candidates"
-                if parsed.path in {"/actions/topic-promote", "/actions/topic-ignore"}
-                else "/backtest"
-                if parsed.path in {
-                    "/actions/market-import-prices",
-                    "/actions/market-sync-stooq",
-                    "/actions/backtest-reports",
-                }
-                else "/reports"
-                if parsed.path == "/actions/report-daily"
-                else "/tasks"
+            self.redirect(
+                action_fallback_path(parsed.path, form),
+                f"操作失败：{exc}",
+                ok=False,
             )
-            self.redirect(fallback_path, f"操作失败：{exc}", ok=False)
+        finally:
+            ADMIN_ACCESS_CONTEXT.reset(context_token)
 
     def resolve_database_url(self) -> str | None:
         return self.server.database_url
+
+    def resolve_admin_access(
+        self,
+        *,
+        query: Mapping[str, list[str]],
+        form: Mapping[str, list[str]] | None = None,
+    ) -> AdminAccess:
+        expected = self.server.admin_action_token
+        if not expected:
+            access = AdminAccess(protected=False, allowed=True)
+            self.write_admin_auth_log(
+                "resolve_admin_access",
+                {
+                    "protected": access.protected,
+                    "allowed": access.allowed,
+                    "expected_token_configured": False,
+                },
+                query=query,
+                form=form,
+            )
+            return access
+
+        candidates = {
+            "query": form_value(query, ADMIN_ACTION_TOKEN_QUERY_PARAM),
+            "cookie": self.admin_cookie_token(),
+            "header": (self.headers.get("X-Admin-Action-Token") or "").strip(),
+        }
+        if form is not None:
+            candidates["form"] = form_value(form, ADMIN_ACTION_TOKEN_QUERY_PARAM)
+
+        matches = {
+            source: admin_token_matches(expected, token)
+            for source, token in candidates.items()
+        }
+        access = AdminAccess(protected=True, allowed=any(matches.values()))
+        self.write_admin_auth_log(
+            "resolve_admin_access",
+            {
+                "protected": access.protected,
+                "allowed": access.allowed,
+                "expected_token_configured": True,
+                "expected_token_fingerprint": token_fingerprint(expected),
+                "source_present": {
+                    source: bool(token) for source, token in candidates.items()
+                },
+                "source_match": matches,
+                "source_fingerprint": {
+                    source: token_fingerprint(token)
+                    for source, token in candidates.items()
+                    if token
+                },
+            },
+            query=query,
+            form=form,
+        )
+        return access
+
+    def admin_query_token_was_provided(self, query: Mapping[str, list[str]]) -> bool:
+        return ADMIN_ACTION_TOKEN_QUERY_PARAM in query
+
+    def admin_query_token_is_valid(self, query: Mapping[str, list[str]]) -> bool:
+        return admin_token_matches(
+            self.server.admin_action_token,
+            form_value(query, ADMIN_ACTION_TOKEN_QUERY_PARAM),
+        )
+
+    def admin_cookie_token(self) -> str:
+        raw_cookie = self.headers.get("Cookie") or ""
+        if not raw_cookie:
+            self.write_admin_auth_log(
+                "cookie_token_missing",
+                {"reason": "no_cookie_header"},
+            )
+            return ""
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw_cookie)
+        except Exception as exc:
+            self.write_admin_auth_log(
+                "cookie_token_invalid",
+                {
+                    "error": str(exc),
+                    "cookie_header_length": len(raw_cookie),
+                },
+            )
+            return ""
+        morsel = cookie.get(ADMIN_ACTION_COOKIE_NAME)
+        token = urllib.parse.unquote(morsel.value.strip()) if morsel else ""
+        self.write_admin_auth_log(
+            "cookie_token_resolved",
+            {
+                "cookie_names": sorted(cookie.keys()),
+                "admin_cookie_present": morsel is not None,
+                "cookie_token_fingerprint": token_fingerprint(token),
+            },
+        )
+        return token
+
+    def admin_cookie_header(self) -> str:
+        return (
+            f"{ADMIN_ACTION_COOKIE_NAME}={urllib.parse.quote(self.server.admin_action_token, safe='')}; "
+            "Path=/; HttpOnly; SameSite=Strict"
+        )
+
+    def path_without_admin_token(self, parsed: urllib.parse.ParseResult) -> str:
+        params = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+            if key != ADMIN_ACTION_TOKEN_QUERY_PARAM
+        ]
+        query = urllib.parse.urlencode(params)
+        return urllib.parse.urlunparse(("", "", parsed.path or "/", "", query, ""))
+
+    def redirect_to(self, path: str, *, set_admin_cookie: bool = False) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", path)
+        if set_admin_cookie:
+            self.send_header("Set-Cookie", self.admin_cookie_header())
+        self.end_headers()
 
     def redirect(self, path: str, message: str, *, ok: bool) -> None:
         params = urllib.parse.urlencode(
@@ -891,16 +1108,119 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Location", f"{path}{separator}{params}")
         self.end_headers()
 
-    def send_html(self, status: HTTPStatus, body: str) -> None:
+    def send_html(
+        self,
+        status: HTTPStatus,
+        body: str,
+        *,
+        set_admin_cookie: bool = False,
+    ) -> None:
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        if set_admin_cookie:
+            self.send_header("Set-Cookie", self.admin_cookie_header())
+            self.write_admin_auth_log(
+                "set_admin_cookie",
+                {
+                    "status": int(status),
+                    "token_fingerprint": token_fingerprint(
+                        self.server.admin_action_token
+                    ),
+                },
+            )
         self.end_headers()
         self.wfile.write(payload)
 
+    def write_admin_auth_log(
+        self,
+        event: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        parsed: urllib.parse.ParseResult | None = None,
+        query: Mapping[str, list[str]] | None = None,
+        form: Mapping[str, list[str]] | None = None,
+    ) -> None:
+        request_path = parsed.path if parsed else urllib.parse.urlparse(self.path).path
+        request_query = query if query is not None else {}
+        request_form = form if form is not None else {}
+        write_admin_auth_log(
+            event,
+            {
+                "method": self.command,
+                "path": request_path,
+                "query_keys": sorted(request_query.keys()),
+                "form_keys": sorted(request_form.keys()),
+                "has_query_admin_token": ADMIN_ACTION_TOKEN_QUERY_PARAM in request_query,
+                "has_form_admin_token": ADMIN_ACTION_TOKEN_QUERY_PARAM in request_form,
+                "has_admin_header": bool(
+                    (self.headers.get("X-Admin-Action-Token") or "").strip()
+                ),
+                "has_cookie_header": bool(self.headers.get("Cookie")),
+                "referer": self.headers.get("Referer") or "",
+                "origin": self.headers.get("Origin") or "",
+                **dict(payload or {}),
+            },
+        )
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[admin] " + fmt % args + "\n")
+
+
+def current_admin_access() -> AdminAccess:
+    return ADMIN_ACCESS_CONTEXT.get()
+
+
+def admin_token_matches(expected: str | None, candidate: str | None) -> bool:
+    if not expected or not candidate:
+        return False
+    return secrets.compare_digest(expected, candidate)
+
+
+def token_fingerprint(token: str | None) -> str:
+    if not token:
+        return ""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"len={len(token)} sha256={digest[:12]}"
+
+
+def write_admin_auth_log(event: str, payload: Mapping[str, Any]) -> None:
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        "pid": os.getpid(),
+        "thread_id": threading.get_native_id(),
+        **dict(payload),
+    }
+    try:
+        ADMIN_AUTH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ADMIN_AUTH_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:  # pragma: no cover - diagnostics must not break requests.
+        sys.stderr.write(f"[admin-auth-log] 写入失败: {exc}\n")
+
+
+def admin_actions_are_allowed() -> bool:
+    return current_admin_access().allowed
+
+
+def action_fallback_path(
+    action_path: str,
+    form: Mapping[str, list[str]] | None = None,
+) -> str:
+    form = form or {}
+    if action_path in {"/actions/topic-promote", "/actions/topic-ignore"}:
+        return "/topics?pane=candidates"
+    if action_path in {
+        "/actions/market-import-prices",
+        "/actions/market-sync-stooq",
+        "/actions/backtest-reports",
+    }:
+        return safe_return_path(form, "/backtest")
+    if action_path == "/actions/report-daily":
+        return "/reports"
+    return "/tasks"
 
 
 def get_database_url(database_url: str | None = None) -> str:
@@ -2099,6 +2419,7 @@ def render_reports(
 ) -> str:
     selected_uid = form_value(query, "uid")
     today = date.today()
+    admin_disabled = " disabled" if not admin_actions_are_allowed() else ""
 
     try:
         with connect_database(database_url) as conn:
@@ -2175,7 +2496,7 @@ def render_reports(
             <p>复用 daily_candidate_scores 和 daily_watchlists，不重新抓取外部数据。</p>
           </div>
           <div class="button-row action-row">
-            <button class="primary" type="submit">生成报告</button>
+            <button class="primary" type="submit"{admin_disabled}>生成报告</button>
           </div>
         </div>
         <div class="form-sections">
@@ -2521,8 +2842,10 @@ def render_discovery_action_row(
     include_oob: bool = False,
 ) -> str:
     running = progress_snapshot.get("status") == "running"
+    admin_disabled = not admin_actions_are_allowed()
     oob_attr = ' hx-swap-oob="outerHTML"' if include_oob else ""
-    run_disabled = " disabled" if running else ""
+    run_disabled = " disabled" if running or admin_disabled else ""
+    schedule_disabled = " disabled" if admin_disabled else ""
     run_busy = ' aria-busy="true"' if running else ""
     run_label = "同步中..." if running else "运行一次"
     return f"""
@@ -2534,8 +2857,14 @@ def render_discovery_action_row(
         formaction="/actions/discovery-daily"
         {run_disabled}{run_busy}
       >{run_label}</button>
-      <button type="submit" formaction="/actions/discovery-schedule-start">启动定时</button>
-      <button type="submit" formaction="/actions/discovery-schedule-stop">停止定时</button>
+      <button
+        type="submit"
+        formaction="/actions/discovery-schedule-start"{schedule_disabled}
+      >启动定时</button>
+      <button
+        type="submit"
+        formaction="/actions/discovery-schedule-stop"{schedule_disabled}
+      >停止定时</button>
     </div>
     """
 
@@ -2975,6 +3304,10 @@ def format_market_sync_result_message(result: market.MarketPriceSyncResult) -> s
     return message
 
 
+def market_sync_notice_is_ok(result: market.MarketPriceSyncResult) -> bool:
+    return bool(result.synced_tickers) and not result.failed_tickers
+
+
 def resolve_project_path(value: str) -> Path:
     text = value.strip()
     if not text:
@@ -3361,6 +3694,8 @@ def render_topic_candidate_actions(row: dict[str, Any]) -> str:
     status = str(row.get("status") or "pending")
     matched = row.get("matched_topic_slug")
     slug = str(row.get("candidate_slug") or "").strip()
+    if not admin_actions_are_allowed():
+        return '<span class="subtle">只读</span>'
     if status != "pending":
         return '<span class="subtle">-</span>'
     if not slug:
@@ -4374,6 +4709,31 @@ def layout(
     active: str,
     query: Mapping[str, list[str]],
 ) -> str:
+    admin_access = current_admin_access()
+    admin_readonly = admin_access.protected and not admin_access.allowed
+    app_class = "app-shell admin-readonly" if admin_readonly else "app-shell"
+    admin_readonly_js = "true" if admin_readonly else "false"
+    admin_badge_html = ""
+    readonly_notice_html = ""
+    sidebar_note = (
+        "轻量本地面板，无登录和权限系统。数据动作仍由当前 Python 服务执行。"
+    )
+    if admin_access.protected:
+        if admin_access.allowed:
+            admin_badge_html = '<span class="admin-mode-badge ok">管理权限</span>'
+            sidebar_note = (
+                "当前浏览器已具备管理员动作权限，可执行同步、报告和数据维护。"
+            )
+        else:
+            admin_badge_html = '<span class="admin-mode-badge readonly">只读浏览</span>'
+            sidebar_note = (
+                "当前为只读浏览，访客可以查看数据，但不能执行同步、报告和维护动作。"
+            )
+            readonly_notice_html = """
+            <div class="notice readonly" role="status">
+              <span>当前为只读浏览，数据同步、报告生成和维护动作仅管理员可执行。</span>
+            </div>
+            """
     notice = form_value(query, "notice")
     notice_type = form_value(query, "notice_type") or "ok"
     notice_html = (
@@ -4521,6 +4881,107 @@ def layout(
     }});
     document.addEventListener("htmx:afterSettle", (event) => {{
       window.usstockTablePager.init(event.target || document);
+    }});
+  </script>
+  <script>
+    window.usstockAdminAccess = {{
+      readonly: {admin_readonly_js},
+      tokenName: "{e(ADMIN_ACTION_TOKEN_QUERY_PARAM)}",
+      token: new URLSearchParams(window.location.search).get("{e(ADMIN_ACTION_TOKEN_QUERY_PARAM)}") || "",
+      apply(root) {{
+        this.applyAdminToken(root);
+        if (!this.readonly) {{
+          return;
+        }}
+        const scope = root || document;
+        const forms = [];
+        if (scope.matches && scope.matches('form[method="post"]')) {{
+          forms.push(scope);
+        }}
+        if (scope.querySelectorAll) {{
+          forms.push(...scope.querySelectorAll('form[method="post"]'));
+        }}
+
+        forms.forEach((form) => {{
+          if (form.dataset.adminReadonlyReady === "1") {{
+            return;
+          }}
+          form.dataset.adminReadonlyReady = "1";
+          form.dataset.adminReadonly = "1";
+          form.setAttribute("aria-disabled", "true");
+          form.addEventListener("submit", (event) => {{
+            event.preventDefault();
+          }});
+          form.querySelectorAll("input, textarea, select, button").forEach((element) => {{
+            if (element.matches('input[type="hidden"]')) {{
+              return;
+            }}
+            element.disabled = true;
+            element.title = "只读浏览";
+          }});
+        }});
+      }},
+      applyAdminToken(root) {{
+        if (!this.token) {{
+          return;
+        }}
+        const scope = root || document;
+        const forms = [];
+        if (scope.matches && scope.matches('form[method="post"]')) {{
+          forms.push(scope);
+        }}
+        if (scope.querySelectorAll) {{
+          forms.push(...scope.querySelectorAll('form[method="post"]'));
+        }}
+        forms.forEach((form) => {{
+          let input = form.querySelector('input[type="hidden"][name="' + this.tokenName + '"]');
+          if (!input) {{
+            input = document.createElement("input");
+            input.type = "hidden";
+            input.name = this.tokenName;
+            form.appendChild(input);
+          }}
+          input.value = this.token;
+        }});
+
+        const links = [];
+        if (scope.matches && scope.matches("a[href]")) {{
+          links.push(scope);
+        }}
+        if (scope.querySelectorAll) {{
+          links.push(...scope.querySelectorAll("a[href]"));
+        }}
+        links.forEach((link) => {{
+          const href = link.getAttribute("href") || "";
+          if (
+            !href ||
+            href.startsWith("#") ||
+            href.startsWith("mailto:") ||
+            href.startsWith("tel:") ||
+            href.startsWith("javascript:")
+          ) {{
+            return;
+          }}
+          let url;
+          try {{
+            url = new URL(href, window.location.href);
+          }} catch (error) {{
+            return;
+          }}
+          if (url.origin !== window.location.origin || url.searchParams.has(this.tokenName)) {{
+            return;
+          }}
+          url.searchParams.set(this.tokenName, this.token);
+          link.href = url.pathname + url.search + url.hash;
+        }});
+      }},
+    }};
+
+    document.addEventListener("DOMContentLoaded", () => {{
+      window.usstockAdminAccess.apply(document);
+    }});
+    document.addEventListener("htmx:afterSettle", (event) => {{
+      window.usstockAdminAccess.apply(event.target || document);
     }});
   </script>
   <script src="{HTMX_JS_URL}" defer></script>
@@ -4743,6 +5204,29 @@ def layout(
       background: rgba(255, 255, 255, 0.04);
       font-size: 12px;
       line-height: 1.55;
+    }}
+    .admin-mode-badge {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 12px;
+      font-weight: 760;
+      white-space: nowrap;
+    }}
+    .admin-mode-badge.ok {{
+      border-color: #b8dfc5;
+      color: var(--ok);
+      background: var(--notice-ok-bg);
+    }}
+    .admin-mode-badge.readonly {{
+      border-color: #eddb9a;
+      color: var(--watch);
+      background: var(--badge-watch-bg);
     }}
     .pane-breadcrumbs {{
       display: flex;
@@ -5521,6 +6005,12 @@ def layout(
       cursor: not-allowed;
       opacity: 0.78;
     }}
+    .app-shell.admin-readonly form[method="post"] {{
+      opacity: 0.78;
+    }}
+    .app-shell.admin-readonly form[method="post"] button {{
+      cursor: not-allowed;
+    }}
     .button.ghost {{
       background: transparent;
     }}
@@ -5779,6 +6269,11 @@ def layout(
       color: var(--error);
       background: var(--notice-error-bg);
     }}
+    .notice.readonly {{
+      border-color: #eddb9a;
+      color: var(--watch);
+      background: var(--badge-watch-bg);
+    }}
     .notice-close {{
       width: 28px;
       min-width: 28px;
@@ -5941,7 +6436,7 @@ def layout(
 <body>
   <div
     id="app"
-    class="app-shell"
+    class="{e(app_class)}"
     x-data="{{
       navOpen: false,
       lightsOn: window.usstockPanelTheme.read(),
@@ -5968,7 +6463,7 @@ def layout(
         </span>
       </div>
       <nav class="nav-list">{nav}</nav>
-      <div class="sidebar-note">轻量本地面板，无登录和权限系统。数据动作仍由当前 Python 服务执行。</div>
+      <div class="sidebar-note">{e(sidebar_note)}</div>
     </aside>
     <div class="content-shell">
       <header class="topbar">
@@ -5990,6 +6485,7 @@ def layout(
           <strong>{e(title)}</strong>
         </div>
         <div class="topbar-actions">
+          {admin_badge_html}
           <button
             class="light-toggle"
             type="button"
@@ -6005,6 +6501,7 @@ def layout(
       </header>
       <main class="content">
         {notice_html}
+        {readonly_notice_html}
         {body}
       </main>
     </div>
@@ -6080,15 +6577,36 @@ def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     database_url: str | None = None,
+    admin_action_token: str | None = None,
 ) -> None:
     database_url = get_database_url(database_url)
+    configured_admin_token = admin_action_token or get_settings().admin_action_token
+    resolved_admin_token = configured_admin_token or secrets.token_urlsafe(24)
     server = AdminHTTPServer(
         (host, port),
         AdminRequestHandler,
         database_url=database_url,
+        admin_action_token=resolved_admin_token,
     )
     url = f"http://{host}:{port}"
+    admin_url = (
+        f"{url}/?{ADMIN_ACTION_TOKEN_QUERY_PARAM}="
+        f"{urllib.parse.quote(resolved_admin_token)}"
+    )
+    write_admin_auth_log(
+        "admin_server_start",
+        {
+            "host": host,
+            "port": port,
+            "project_root": str(PROJECT_ROOT),
+            "admin_token_configured": bool(configured_admin_token),
+            "admin_token_fingerprint": token_fingerprint(resolved_admin_token),
+        },
+    )
     print(f"本地管理面板已启动：{url}")
+    print(f"管理员动作地址：{admin_url}")
+    if not configured_admin_token:
+        print("未配置 ADMIN_ACTION_TOKEN，本次启动使用临时管理员动作令牌。")
     print("按 Ctrl+C 停止。")
     try:
         server.serve_forever()
@@ -6103,6 +6621,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=DEFAULT_HOST, help="监听地址")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="监听端口")
     parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    parser.add_argument(
+        "--admin-action-token",
+        help=(
+            "管理员动作令牌；未提供时读取 ADMIN_ACTION_TOKEN，"
+            "否则启动时生成临时令牌"
+        ),
+    )
     return parser
 
 
@@ -6110,7 +6635,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        serve(host=args.host, port=args.port, database_url=args.database_url)
+        serve(
+            host=args.host,
+            port=args.port,
+            database_url=args.database_url,
+            admin_action_token=args.admin_action_token,
+        )
         return 0
     except AdminPanelError as exc:
         print(f"管理面板启动失败：{exc}", file=sys.stderr)

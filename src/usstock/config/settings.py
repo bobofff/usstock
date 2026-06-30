@@ -49,6 +49,7 @@ class Settings:
     """从环境变量和 .env 读取后的运行时配置。"""
 
     database_url: str | None
+    admin_action_token: str | None
     migrations_dir: Path
     sec_user_agent: str | None
     sec_rate_limit_per_second: float
@@ -75,6 +76,11 @@ def get_settings() -> Settings:
     env_file_values = read_env_file()
 
     database_url = os.environ.get("DATABASE_URL") or env_file_values.get("DATABASE_URL")
+    admin_action_token = (
+        os.environ.get("ADMIN_ACTION_TOKEN")
+        or env_file_values.get("ADMIN_ACTION_TOKEN")
+    )
+    admin_action_token = admin_action_token.strip() if admin_action_token else None
     migrations_dir_value = (
         os.environ.get("MIGRATIONS_DIR")
         or env_file_values.get("MIGRATIONS_DIR")
@@ -178,6 +184,7 @@ def get_settings() -> Settings:
 
     return Settings(
         database_url=database_url,
+        admin_action_token=admin_action_token,
         migrations_dir=migrations_dir,
         sec_user_agent=sec_user_agent,
         sec_rate_limit_per_second=sec_rate_limit_per_second,

@@ -12,14 +12,18 @@ from usstock.data import market
 
 
 class _FakeUrlResponse:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, content_type: str = "text/csv") -> None:
         self.text = text
+        self.headers = {"Content-Type": content_type}
 
     def __enter__(self) -> "_FakeUrlResponse":
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
+
+    def getcode(self) -> int:
+        return 200
 
     def read(self) -> bytes:
         return self.text.encode("utf-8")
@@ -152,6 +156,29 @@ class MarketPriceImportTest(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(len(prices), 1)
         self.assertEqual(prices[0].ticker, "AAPL")
+
+    def test_stooq_client_rejects_browser_verification_html(self) -> None:
+        response = _FakeUrlResponse(
+            """
+            <!DOCTYPE html><html><body>
+            <noscript>This site requires JavaScript to verify your browser.</noscript>
+            </body></html>
+            """,
+            content_type="text/html",
+        )
+        client = market.StooqClient(
+            requests_per_second=1000,
+            retry_attempts=1,
+            retry_backoff_seconds=0,
+        )
+
+        with (
+            patch.object(market.urllib.request, "urlopen", return_value=response),
+            self.assertRaises(market.MarketDataError) as raised,
+        ):
+            client.daily_prices(ticker="AAPL")
+
+        self.assertIn("浏览器 JavaScript 验证页", str(raised.exception))
 
     def test_sync_stooq_daily_prices_continues_after_ticker_failure(self) -> None:
         client = _FakeStooqClient()

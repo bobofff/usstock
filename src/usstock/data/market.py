@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
+import os
 import sys
 import time
 import urllib.error
@@ -20,7 +22,7 @@ import psycopg
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from usstock.config.settings import get_settings
+from usstock.config.settings import PROJECT_ROOT, get_settings
 from usstock.db import migrations as db_migrations
 
 
@@ -31,10 +33,48 @@ DEFAULT_STOOQ_REQUESTS_PER_SECOND = 1.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_STOOQ_RETRY_ATTEMPTS = 3
 DEFAULT_STOOQ_RETRY_BACKOFF_SECONDS = 1.0
+MARKET_SYNC_LOG_PATH = PROJECT_ROOT / "logs" / "market_sync.log"
 
 
 class MarketDataError(RuntimeError):
     """Raised when market price ingestion fails."""
+
+
+def write_market_sync_log(event: str, payload: dict[str, Any]) -> None:
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        "pid": os.getpid(),
+        **payload,
+    }
+    try:
+        MARKET_SYNC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MARKET_SYNC_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:  # pragma: no cover - diagnostics must not break sync.
+        print(f"[market-sync-log] 写入失败: {exc}", file=sys.stderr)
+
+
+def compact_preview(text: str, *, limit: int = 220) -> str:
+    preview = " ".join(text.strip().split())
+    return preview[:limit]
+
+
+def stooq_response_problem(text: str) -> str | None:
+    stripped = text.strip()
+    lower = stripped.lower()
+    if not stripped:
+        return "Stooq 返回空响应。"
+    if "<html" in lower or "<!doctype html" in lower:
+        if "requires javascript to verify your browser" in lower:
+            return "Stooq 返回了浏览器 JavaScript 验证页，不是 CSV 行情数据。"
+        return "Stooq 返回了 HTML 页面，不是 CSV 行情数据。"
+    first_line = stripped.splitlines()[0] if stripped.splitlines() else ""
+    if first_line and "Date" not in first_line:
+        if "no data" in lower:
+            return None
+        return f"Stooq CSV 表头异常: {first_line[:120]}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -148,6 +188,15 @@ class StooqClient:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     text = response.read().decode("utf-8-sig")
+                    status = (
+                        response.getcode()
+                        if hasattr(response, "getcode")
+                        else None
+                    )
+                    content_type = ""
+                    headers = getattr(response, "headers", None)
+                    if headers is not None:
+                        content_type = headers.get("Content-Type", "")
                 break
             except urllib.error.URLError as exc:
                 last_error = exc
@@ -156,6 +205,23 @@ class StooqClient:
                 time.sleep(self.retry_backoff_seconds * attempt)
         else:  # pragma: no cover - retry_attempts validation keeps this unreachable.
             raise MarketDataError(f"Stooq 日线请求失败: {ticker}: {last_error}")
+
+        problem = stooq_response_problem(text)
+        write_market_sync_log(
+            "stooq_response",
+            {
+                "ticker": normalize_ticker(ticker),
+                "symbol": symbol,
+                "url": url,
+                "status": status,
+                "content_type": content_type,
+                "text_length": len(text),
+                "preview": compact_preview(text),
+                "problem": problem or "",
+            },
+        )
+        if problem:
+            raise MarketDataError(f"{problem} ticker={normalize_ticker(ticker)}")
 
         return parse_stooq_csv_prices(
             text,
@@ -610,6 +676,19 @@ def sync_stooq_daily_prices(
             top_n=top_n,
         )
 
+    write_market_sync_log(
+        "stooq_sync_start",
+        {
+            "requested_tickers": list(requested),
+            "requested_count": len(requested),
+            "from_date": from_date.isoformat() if from_date else "",
+            "to_date": to_date.isoformat() if to_date else "",
+            "from_report_candidates": from_report_candidates,
+            "profile": profile,
+            "top_n": top_n,
+        },
+    )
+
     prices_by_ticker: list[list[DailyPrice]] = []
     for ticker in requested:
         try:
@@ -621,19 +700,41 @@ def sync_stooq_daily_prices(
         except MarketDataError as exc:
             failed.append(ticker)
             failure_messages.append(f"{ticker}: {exc}")
+            write_market_sync_log(
+                "stooq_ticker_failed",
+                {
+                    "ticker": ticker,
+                    "error": str(exc),
+                },
+            )
             continue
         if not prices:
             missing.append(ticker)
+            write_market_sync_log(
+                "stooq_ticker_missing",
+                {
+                    "ticker": ticker,
+                },
+            )
             continue
         prices_by_ticker.append(prices)
         synced.append(ticker)
+        write_market_sync_log(
+            "stooq_ticker_synced",
+            {
+                "ticker": ticker,
+                "price_count": len(prices),
+                "first_price_date": prices[0].price_date.isoformat(),
+                "last_price_date": prices[-1].price_date.isoformat(),
+            },
+        )
 
     with psycopg.connect(database_url, autocommit=False) as conn:
         with conn.transaction():
             for prices in prices_by_ticker:
                 total_count += upsert_daily_prices(conn, prices)
 
-    return MarketPriceSyncResult(
+    result = MarketPriceSyncResult(
         provider=STOOQ_DATA_SOURCE,
         requested_tickers=requested,
         synced_tickers=tuple(synced),
@@ -644,6 +745,21 @@ def sync_stooq_daily_prices(
         failed_tickers=tuple(failed),
         failure_messages=tuple(failure_messages),
     )
+    write_market_sync_log(
+        "stooq_sync_result",
+        {
+            "requested_count": len(result.requested_tickers),
+            "synced_count": len(result.synced_tickers),
+            "missing_count": len(result.missing_tickers),
+            "failed_count": len(result.failed_tickers),
+            "price_count": result.price_count,
+            "synced_tickers": list(result.synced_tickers[:20]),
+            "missing_tickers": list(result.missing_tickers[:20]),
+            "failed_tickers": list(result.failed_tickers[:20]),
+            "failure_messages": list(result.failure_messages[:20]),
+        },
+    )
+    return result
 
 
 def render_sync_result(result: MarketPriceSyncResult) -> str:
