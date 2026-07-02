@@ -724,7 +724,7 @@ def fetch_stock_universe(conn: Connection) -> dict[str, dict[str, Any]]:
         """
         SELECT ticker, company_name, sector, industry, business_description,
                market_cap_usd, avg_volume_30d, is_active, is_manual_watchlist,
-               is_sp500, is_nasdaq100
+               is_sp500, is_nasdaq100, exchange, asset_type, data_source
         FROM stock_universe
         WHERE is_active
         """
@@ -742,6 +742,9 @@ def fetch_stock_universe(conn: Connection) -> dict[str, dict[str, Any]]:
             "is_manual_watchlist": row[8],
             "is_sp500": row[9],
             "is_nasdaq100": row[10],
+            "exchange": row[11],
+            "asset_type": row[12],
+            "data_source": row[13],
         }
         for row in rows
     }

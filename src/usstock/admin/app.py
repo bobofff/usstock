@@ -37,7 +37,22 @@ from usstock.data import gdelt, sec
 from usstock.data import market
 from usstock.discovery import daily as discovery
 from usstock.discovery import topic_candidates
+from usstock.polymarket_weather.buckets import parse_temperature_bucket
+from usstock.polymarket_weather.cache import FileCache
+from usstock.polymarket_weather.config import load_trading_config
+from usstock.polymarket_weather.engine import PredictionEngine
+from usstock.polymarket_weather.http import JsonHttpClient
+from usstock.polymarket_weather.ledger import TradeLedger
+from usstock.polymarket_weather.market import GammaMarketClient
+from usstock.polymarket_weather.models import BucketSignal, MarketBucket, TemperatureKind
+from usstock.polymarket_weather.risk import PositionSizer, RiskConfig
+from usstock.polymarket_weather.weather import (
+    NWSForecastClient,
+    OpenMeteoForecastClient,
+    WeatherEnsembleProvider,
+)
 from usstock.reports import daily_report
+from usstock.screening import universe as stock_universe
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -584,6 +599,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 "/topics": render_topics,
                 "/reports": render_reports,
                 "/backtest": render_backtest,
+                "/weather": render_weather,
                 "/tasks": render_tasks,
             }
             renderer = routes.get(parsed.path)
@@ -806,6 +822,43 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                     safe_return_path(form, "/backtest"),
                     f"日线价格导入完成：{count} 行。",
                     ok=True,
+                )
+                return
+
+            if parsed.path == "/actions/market-import-universe":
+                file_path = resolve_project_path(form_value(form, "file_path"))
+                result = stock_universe.import_stock_universe_file(
+                    file_path=file_path,
+                    database_url=database_url,
+                    data_source=(
+                        form_value(form, "data_source")
+                        or stock_universe.DEFAULT_UNIVERSE_DATA_SOURCE
+                    ),
+                    source_url=clean_blank(form_value(form, "source_url")),
+                    filter_config=parse_stock_universe_filter_config(form),
+                    limit=parse_positive_int(form_value(form, "limit")),
+                    dry_run=form_bool(form, "dry_run"),
+                )
+                self.redirect(
+                    "/tasks?pane=manual",
+                    format_stock_universe_import_message(result),
+                    ok=result.accepted_count > 0,
+                )
+                return
+
+            if parsed.path == "/actions/market-sync-nasdaq-universe":
+                result = stock_universe.sync_nasdaq_stock_universe(
+                    database_url=database_url,
+                    filter_config=parse_stock_universe_filter_config(form),
+                    limit=parse_positive_int(form_value(form, "limit")),
+                    dry_run=form_bool(form, "dry_run"),
+                    exchanges=parse_stock_universe_exchanges(form),
+                    use_volume_as_avg_volume=form_bool(form, "use_volume_as_avg_volume"),
+                )
+                self.redirect(
+                    "/tasks?pane=manual",
+                    format_stock_universe_import_message(result),
+                    ok=result.accepted_count > 0,
                 )
                 return
 
@@ -1237,6 +1290,11 @@ def action_fallback_path(
     form = form or {}
     if action_path in {"/actions/topic-promote", "/actions/topic-ignore"}:
         return "/topics?pane=candidates"
+    if action_path in {
+        "/actions/market-import-universe",
+        "/actions/market-sync-nasdaq-universe",
+    }:
+        return safe_return_path(form, "/tasks?pane=manual")
     if action_path in {
         "/actions/market-import-prices",
         "/actions/market-sync-stooq",
@@ -2631,6 +2689,223 @@ def render_backtest(
     return layout("日报复盘", body, active="/backtest", query=query)
 
 
+def render_weather(
+    *,
+    database_url: str | None,
+    query: Mapping[str, list[str]],
+) -> str:
+    del database_url
+    today = date.today()
+    mode = form_value(query, "mode")
+    config_error = ""
+    try:
+        weather_config = load_weather_admin_config(query)
+    except Exception as exc:
+        weather_config = load_trading_config()
+        config_error = str(exc)
+
+    city_id = form_value(query, "city") or "new-york"
+    if city_id not in weather_config.cities:
+        city_id = next(iter(weather_config.cities), "new-york")
+    target_date = form_value(query, "target_date") or today.isoformat()
+    kind = normalize_weather_kind(form_value(query, "kind") or "high")
+    input_error = ""
+    try:
+        bankroll = parse_admin_float(
+            form_value(query, "bankroll"),
+            default=1_000.0,
+            field_name="资金规模",
+            min_value=0.0,
+        )
+        min_edge = parse_admin_float(
+            form_value(query, "min_edge"),
+            default=0.03,
+            field_name="最小 Edge",
+            min_value=0.0,
+        )
+        max_trade_fraction = parse_admin_float(
+            form_value(query, "max_trade_fraction"),
+            default=0.03,
+            field_name="单笔上限",
+            min_value=0.0,
+            max_value=1.0,
+        )
+    except Exception as exc:
+        input_error = str(exc)
+        bankroll = 1_000.0
+        min_edge = 0.03
+        max_trade_fraction = 0.03
+    kelly = form_value(query, "kelly") or "half"
+    config_notice = (
+        f'<p class="error-text">配置读取失败，已回退默认城市配置：{e(config_error)}</p>'
+        if config_error
+        else ""
+    )
+    input_notice = (
+        f'<p class="error-text">参数解析失败，已使用默认风控参数：{e(input_error)}</p>'
+        if input_error
+        else ""
+    )
+    signal_result = (
+        render_weather_signal_result(
+            query=query,
+            city_id=city_id,
+            target_date_text=target_date,
+            kind=kind,
+            bankroll=bankroll,
+            kelly=kelly,
+            min_edge=min_edge,
+            max_trade_fraction=max_trade_fraction,
+        )
+        if mode == "signal"
+        else render_weather_empty_signal()
+    )
+    size_result = (
+        render_weather_size_result(
+            query=query,
+            bankroll=bankroll,
+            kelly=kelly,
+            min_edge=min_edge,
+            max_trade_fraction=max_trade_fraction,
+        )
+        if mode == "size"
+        else ""
+    )
+    ledger_html = render_weather_ledger_summary()
+    city_options = "".join(
+        f'<option value="{e(key)}"{" selected" if key == city_id else ""}>'
+        f'{e(city.name)} ({e(key)})</option>'
+        for key, city in sorted(weather_config.cities.items(), key=lambda item: item[0])
+    )
+    high_selected = " selected" if kind == "high" else ""
+    low_selected = " selected" if kind == "low" else ""
+    kelly_options = render_select_options(["full", "half", "quarter"], kelly)
+    signal_query = form_value(query, "market_query")
+    signal_slug = form_value(query, "market_slug")
+    signal_condition_id = form_value(query, "condition_id")
+    models = form_value(query, "models")
+    config_path = form_value(query, "config_path")
+    refresh_checked = checked(form_bool(query, "refresh_clob"))
+    body = f"""
+    <section class="toolbar">
+      <div>
+        <h1>Polymarket 天气交易</h1>
+        <p class="page-kicker">每日最高/最低温度桶的多模型预测、Edge 发现和 Kelly 仓位控制。</p>
+      </div>
+    </section>
+    <section class="metrics">
+      {metric_box("内置城市", len(weather_config.cities), "可通过 YAML/JSON 扩展")}
+      {metric_box("本地交易", ledger_html["total_trades"], "CSV ledger")}
+      {metric_box("已结算", ledger_html["settled_trades"], f"胜率 {ledger_html['win_rate']}")}
+      {metric_box("累计盈亏", ledger_html["total_pnl"], f"ROI {ledger_html['roi']}")}
+    </section>
+    {config_notice}
+    {input_notice}
+    <section class="task-section">
+      <div class="task-section-header">
+        <div>
+          <h2>天气市场信号</h2>
+          <p>输入城市、日期和 Polymarket 市场关键词，生成每个温度桶的概率、Edge 与推荐仓位。</p>
+        </div>
+      </div>
+      <form class="discovery-panel" method="get" action="/weather">
+        <input type="hidden" name="mode" value="signal">
+        <div class="form-sections">
+          <div class="form-section">
+            <h3>目标市场</h3>
+            <div class="field-grid">
+              <label>城市
+                <select name="city">{city_options}</select>
+              </label>
+              <label>日期 <input name="target_date" type="date" value="{e(target_date)}"></label>
+              <label>类型
+                <select name="kind">
+                  <option value="high"{high_selected}>最高温</option>
+                  <option value="low"{low_selected}>最低温</option>
+                </select>
+              </label>
+              <label>配置文件 <input name="config_path" value="{e(config_path)}" placeholder="config/polymarket_weather.example.yaml"></label>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>Polymarket</h3>
+            <div class="field-grid">
+              <label>市场搜索词 <input name="market_query" value="{e(signal_query)}" placeholder="New York high temperature July 3"></label>
+              <label>Market slug <input name="market_slug" value="{e(signal_slug)}" placeholder="可空"></label>
+              <label>Condition ID <input name="condition_id" value="{e(signal_condition_id)}" placeholder="可空"></label>
+              <label>天气模型 <input name="models" value="{e(models)}" placeholder="ecmwf_ifs025,gfs_seamless,ukmo_seamless"></label>
+            </div>
+            <div class="checkbox-stack">
+              <label><input type="checkbox" name="refresh_clob" value="1" {refresh_checked}> 从 CLOB midpoint 刷新价格</label>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>风控参数</h3>
+            <div class="field-grid">
+              <label>资金规模 <input name="bankroll" type="number" min="0" step="0.01" value="{bankroll:.2f}"></label>
+              <label>Kelly
+                <select name="kelly">{kelly_options}</select>
+              </label>
+              <label>最小 Edge <input name="min_edge" type="number" min="0" max="1" step="0.001" value="{min_edge:.3f}"></label>
+              <label>单笔上限 <input name="max_trade_fraction" type="number" min="0" max="1" step="0.001" value="{max_trade_fraction:.3f}"></label>
+            </div>
+          </div>
+        </div>
+        <div class="button-row action-row">
+          <button class="primary" type="submit">生成信号</button>
+        </div>
+      </form>
+      {signal_result}
+    </section>
+    <section class="task-section">
+      <div class="task-section-header">
+        <div>
+          <h2>手动仓位计算</h2>
+          <p>不访问外部 API，直接按你输入的概率和市场价格计算 Kelly 仓位。</p>
+        </div>
+      </div>
+      <form class="discovery-panel" method="get" action="/weather">
+        <input type="hidden" name="mode" value="size">
+        <input type="hidden" name="city" value="{e(city_id)}">
+        <input type="hidden" name="target_date" value="{e(target_date)}">
+        <input type="hidden" name="kind" value="{e(kind)}">
+        <div class="form-sections">
+          <div class="form-section">
+            <h3>合约与概率</h3>
+            <div class="field-grid">
+              <label>温度桶 <input name="manual_outcome" value="{e(form_value(query, "manual_outcome") or "85 to 86")}" required></label>
+              <label>我的概率 <input name="manual_probability" type="number" min="0" max="1" step="0.001" value="{e(form_value(query, "manual_probability") or "0.38")}"></label>
+              <label>市场价格 <input name="manual_price" type="number" min="0" max="1" step="0.001" value="{e(form_value(query, "manual_price") or "0.29")}"></label>
+              <label>单位
+                <select name="manual_unit">
+                  <option value="F"{" selected" if (form_value(query, "manual_unit") or "F") == "F" else ""}>F</option>
+                  <option value="C"{" selected" if form_value(query, "manual_unit") == "C" else ""}>C</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>资金参数</h3>
+            <div class="field-grid">
+              <label>资金规模 <input name="bankroll" type="number" min="0" step="0.01" value="{bankroll:.2f}"></label>
+              <label>Kelly
+                <select name="kelly">{kelly_options}</select>
+              </label>
+              <label>最小 Edge <input name="min_edge" type="number" min="0" max="1" step="0.001" value="{min_edge:.3f}"></label>
+              <label>单笔上限 <input name="max_trade_fraction" type="number" min="0" max="1" step="0.001" value="{max_trade_fraction:.3f}"></label>
+            </div>
+          </div>
+        </div>
+        <div class="button-row action-row">
+          <button class="primary" type="submit">计算仓位</button>
+        </div>
+      </form>
+      {size_result}
+    </section>
+    """
+    return layout("天气交易", body, active="/weather", query=query)
+
+
 def render_backtest_workspace(
     *,
     database_url: str | None,
@@ -3163,6 +3438,35 @@ def render_manual_sync_tools(*, today: date, week_ago: date) -> str:
         </div>
       </div>
       <div class="task-grid">
+        <form method="post" action="/actions/market-sync-nasdaq-universe">
+          <input type="hidden" name="return_path" value="/tasks?pane=manual">
+          <h2>接口扩充股票池</h2>
+          <p>从 Nasdaq screener 接口拉取 NYSE/Nasdaq/AMEX 标的并复用同一套过滤规则。</p>
+          <label>处理行数 <input name="limit" type="number" min="1" value="200"></label>
+          <label>交易所 <input name="exchanges" value="NASDAQ,NYSE,AMEX"></label>
+          <label>30 日均量 >= <input name="min_avg_volume_30d" type="number" min="0" value="{stock_universe.DEFAULT_MIN_AVG_VOLUME_30D}"></label>
+          <label>市值 >= <input name="min_market_cap_usd" type="number" min="0" value="{stock_universe.DEFAULT_MIN_MARKET_CAP_USD}"></label>
+          <label>价格 >= <input name="min_last_price" type="number" min="0" step="0.01" value="{stock_universe.DEFAULT_MIN_LAST_PRICE}"></label>
+          <label><input type="checkbox" name="dry_run" value="1" checked> 只预览</label>
+          <label><input type="checkbox" name="use_volume_as_avg_volume" value="1" checked> 使用接口 volume 作为流动性代理</label>
+          <label><input type="checkbox" name="require_market_cap" value="1"> 要求市值字段</label>
+          <button class="primary" type="submit">同步接口股票池</button>
+        </form>
+        <form method="post" action="/actions/market-import-universe">
+          <input type="hidden" name="return_path" value="/tasks?pane=manual">
+          <h2>扩充股票池</h2>
+          <p>从本机 CSV/JSONL 导入 NYSE/Nasdaq/AMEX 活跃普通股、ADR 和 REIT。</p>
+          <label>文件路径 <input name="file_path" required placeholder="data/raw/us_active_universe.csv"></label>
+          <label>数据来源 <input name="data_source" value="{e(stock_universe.DEFAULT_UNIVERSE_DATA_SOURCE)}"></label>
+          <label>来源 URL <input name="source_url" placeholder="可空"></label>
+          <label>处理行数 <input name="limit" type="number" min="1" placeholder="先小批量验证"></label>
+          <label>30 日均量 >= <input name="min_avg_volume_30d" type="number" min="0" value="{stock_universe.DEFAULT_MIN_AVG_VOLUME_30D}"></label>
+          <label>市值 >= <input name="min_market_cap_usd" type="number" min="0" value="{stock_universe.DEFAULT_MIN_MARKET_CAP_USD}"></label>
+          <label>价格 >= <input name="min_last_price" type="number" min="0" step="0.01" value="{stock_universe.DEFAULT_MIN_LAST_PRICE}"></label>
+          <label><input type="checkbox" name="dry_run" value="1" checked> 只预览</label>
+          <label><input type="checkbox" name="require_market_cap" value="1"> 要求市值字段</label>
+          <button class="primary" type="submit">导入股票池</button>
+        </form>
         <form method="post" action="/actions/sec-registry">
           <h2>SEC 公司映射</h2>
           <p>刷新 SEC ticker / CIK 映射，并回填股票池里的 CIK。</p>
@@ -3396,6 +3700,366 @@ def format_market_sync_result_message(result: market.MarketPriceSyncResult) -> s
 
 def market_sync_notice_is_ok(result: market.MarketPriceSyncResult) -> bool:
     return bool(result.synced_tickers) and not result.failed_tickers
+
+
+def load_weather_admin_config(query: Mapping[str, list[str]]):
+    config_path = clean_blank(form_value(query, "config_path"))
+    if not config_path:
+        return load_trading_config()
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return load_trading_config(path)
+
+
+def build_weather_admin_engine(config, *, min_edge: float) -> PredictionEngine:
+    cache = FileCache()
+    return PredictionEngine(
+        weather_provider=WeatherEnsembleProvider(
+            open_meteo=OpenMeteoForecastClient(
+                base_url=config.open_meteo_base_url,
+                http_client=JsonHttpClient(
+                    base_url=config.open_meteo_base_url,
+                    timeout_seconds=config.request_timeout_seconds,
+                ),
+                cache=cache,
+                cache_max_age_seconds=config.cache_max_age_seconds,
+            ),
+            nws=NWSForecastClient(
+                http_client=JsonHttpClient(
+                    base_url="https://api.weather.gov",
+                    timeout_seconds=config.request_timeout_seconds,
+                    user_agent="usstock-polymarket-weather/0.1 contact:local",
+                ),
+                cache=cache,
+                cache_max_age_seconds=config.cache_max_age_seconds,
+            ),
+        ),
+        market_client=GammaMarketClient(
+            gamma_base_url=config.gamma_base_url,
+            clob_base_url=config.clob_base_url,
+            http_client=JsonHttpClient(
+                base_url=config.gamma_base_url,
+                timeout_seconds=config.request_timeout_seconds,
+            ),
+            clob_http_client=JsonHttpClient(
+                base_url=config.clob_base_url,
+                timeout_seconds=config.request_timeout_seconds,
+            ),
+            cache=cache,
+            cache_max_age_seconds=min(config.cache_max_age_seconds, 90),
+        ),
+        buy_edge_threshold=min_edge,
+    )
+
+
+def render_weather_empty_signal() -> str:
+    return """
+    <div class="empty" role="status">
+      填好城市、日期和市场搜索词后点击生成信号。未点击前不会访问外部 API。
+    </div>
+    """
+
+
+def render_weather_signal_result(
+    *,
+    query: Mapping[str, list[str]],
+    city_id: str,
+    target_date_text: str,
+    kind: TemperatureKind,
+    bankroll: float,
+    kelly: str,
+    min_edge: float,
+    max_trade_fraction: float,
+) -> str:
+    try:
+        config = load_weather_admin_config(query)
+        city = config.cities[city_id]
+        target_date = parse_weather_date(target_date_text, field_name="目标日期")
+        market_query = clean_blank(form_value(query, "market_query"))
+        market_slug = clean_blank(form_value(query, "market_slug"))
+        condition_id = clean_blank(form_value(query, "condition_id"))
+        if not market_query and not market_slug and not condition_id:
+            temperature_label = "high" if kind == "high" else "low"
+            market_query = f"{city.name} {target_date.isoformat()} {temperature_label} temperature"
+        engine = build_weather_admin_engine(config, min_edge=min_edge)
+        report = engine.build_report(
+            city=city,
+            target_date=target_date,
+            kind=kind,
+            market_query=market_query,
+            market_slug=market_slug,
+            condition_id=condition_id,
+            models=parse_weather_models(form_value(query, "models")),
+            refresh_clob_midpoints=form_bool(query, "refresh_clob"),
+        )
+        risk = RiskConfig(
+            bankroll=bankroll,
+            kelly_mode=kelly,
+            min_edge=min_edge,
+            max_trade_fraction=max_trade_fraction,
+        )
+        return f"""
+        <section class="result-panel">
+          <div class="toolbar">
+            <div>
+              <h2>信号结果</h2>
+              <p class="subtle">{e(report.market_question)}</p>
+            </div>
+          </div>
+          <section class="metrics">
+            {metric_box("预测均值", f"{report.distribution.mean:.2f} {report.distribution.unit}", "ensemble mean")}
+            {metric_box("预测标准差", f"{report.distribution.std:.2f}", "含模型误差")}
+            {metric_box("模型数量", len(report.ensemble.points), ", ".join(report.ensemble.source_models))}
+            {metric_box("温度桶", len(report.signals), "Polymarket outcomes")}
+          </section>
+          {render_weather_signal_table(report.signals, risk)}
+        </section>
+        """
+    except Exception as exc:
+        return f"""
+        <div class="notice error" role="status">
+          <span>天气信号生成失败：{e(exc)}</span>
+        </div>
+        """
+
+
+def render_weather_signal_table(
+    signals: tuple[BucketSignal, ...],
+    risk: RiskConfig,
+) -> str:
+    if not signals:
+        return empty_state("没有可展示的温度桶。")
+    rows: list[str] = []
+    sizer = PositionSizer()
+    for signal in signals:
+        position = sizer.size_yes(signal, risk)
+        badge_class = "ok" if position.should_trade else "muted"
+        action = "可交易" if position.should_trade else position.reason
+        rows.append(
+            f"""
+            <tr>
+              <td>{e(signal.market_bucket.outcome)}</td>
+              <td>{signal.probability:.2%}</td>
+              <td>{signal.market_price:.4f}</td>
+              <td>{signal.edge:.2%}</td>
+              <td>{signal.expected_value:.2%}</td>
+              <td><span class="badge {badge_class}">{e(action)}</span></td>
+              <td>{position.stake:.2f}</td>
+              <td>{position.shares:.2f}</td>
+            </tr>
+            """
+        )
+    return table(
+        """
+        <tr>
+          <th>温度桶</th>
+          <th>我的概率</th>
+          <th>市场价格</th>
+          <th>Edge</th>
+          <th>EV</th>
+          <th>动作</th>
+          <th>建议投入</th>
+          <th>份额</th>
+        </tr>
+        """,
+        "".join(rows),
+    )
+
+
+def render_weather_size_result(
+    *,
+    query: Mapping[str, list[str]],
+    bankroll: float,
+    kelly: str,
+    min_edge: float,
+    max_trade_fraction: float,
+) -> str:
+    try:
+        outcome = form_value(query, "manual_outcome") or "85 to 86"
+        unit = form_value(query, "manual_unit") or "F"
+        probability = parse_admin_float(
+            form_value(query, "manual_probability"),
+            default=0.0,
+            field_name="我的概率",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        price = parse_admin_float(
+            form_value(query, "manual_price"),
+            default=0.0,
+            field_name="市场价格",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        bucket = parse_temperature_bucket(outcome, default_unit=unit)
+        signal = BucketSignal(
+            market_bucket=MarketBucket(
+                market_id="manual",
+                question="manual sizing",
+                slug=None,
+                condition_id=None,
+                outcome=outcome,
+                price=price,
+                bucket=bucket,
+            ),
+            probability=probability,
+            market_price=price,
+            edge=probability - price,
+            expected_value=probability - price,
+            fair_price=probability,
+            recommendation="BUY_YES",
+        )
+        position = PositionSizer().size_yes(
+            signal,
+            RiskConfig(
+                bankroll=bankroll,
+                kelly_mode=kelly,
+                min_edge=min_edge,
+                max_trade_fraction=max_trade_fraction,
+            ),
+        )
+        return f"""
+        <section class="metrics">
+          {metric_box("是否交易", "是" if position.should_trade else "否", position.reason)}
+          {metric_box("Full Kelly", f"{position.full_kelly_fraction:.2%}", "未缩放比例")}
+          {metric_box("建议投入", f"{position.stake:.2f}", f"份额 {position.shares:.2f}")}
+          {metric_box("最大亏损", f"{position.max_loss:.2f}", f"潜在盈利 {position.potential_profit:.2f}")}
+        </section>
+        """
+    except Exception as exc:
+        return f"""
+        <div class="notice error" role="status">
+          <span>仓位计算失败：{e(exc)}</span>
+        </div>
+        """
+
+
+def render_weather_ledger_summary() -> dict[str, str]:
+    try:
+        stats = TradeLedger().stats()
+    except Exception:
+        return {
+            "total_trades": "-",
+            "settled_trades": "-",
+            "win_rate": "-",
+            "total_pnl": "-",
+            "roi": "-",
+        }
+    return {
+        "total_trades": fmt(stats.total_trades),
+        "settled_trades": fmt(stats.settled_trades),
+        "win_rate": f"{stats.win_rate:.2%}",
+        "total_pnl": f"{stats.total_pnl:.2f}",
+        "roi": f"{stats.roi:.2%}",
+    }
+
+
+def parse_weather_date(value: str, *, field_name: str) -> date:
+    if not value:
+        raise AdminPanelError(f"{field_name} 不能为空。")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise AdminPanelError(f"{field_name} 必须是 YYYY-MM-DD。") from exc
+
+
+def parse_weather_models(value: str) -> tuple[str, ...] | None:
+    models = tuple(item.strip() for item in value.split(",") if item.strip())
+    return models or None
+
+
+def normalize_weather_kind(value: str) -> TemperatureKind:
+    return "low" if value.strip().lower() == "low" else "high"
+
+
+def parse_admin_float(
+    value: str,
+    *,
+    default: float,
+    field_name: str,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    if not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise AdminPanelError(f"{field_name} 必须是有效数字。") from exc
+    if min_value is not None and parsed < min_value:
+        raise AdminPanelError(f"{field_name} 不能小于 {min_value}。")
+    if max_value is not None and parsed > max_value:
+        raise AdminPanelError(f"{field_name} 不能大于 {max_value}。")
+    return parsed
+
+
+def parse_universe_decimal(
+    value: str,
+    *,
+    field_name: str,
+    default: Decimal,
+) -> Decimal:
+    if not value.strip():
+        return default
+    parsed = stock_universe.parse_decimal(value)
+    if parsed is None:
+        raise AdminPanelError(f"{field_name} 必须是有效数字。")
+    if parsed < 0:
+        raise AdminPanelError(f"{field_name} 不能小于 0。")
+    return parsed
+
+
+def parse_stock_universe_filter_config(
+    form: Mapping[str, list[str]],
+) -> stock_universe.StockUniverseFilterConfig:
+    return stock_universe.StockUniverseFilterConfig(
+        min_avg_volume_30d=parse_universe_decimal(
+            form_value(form, "min_avg_volume_30d"),
+            field_name="30 日均量门槛",
+            default=stock_universe.DEFAULT_MIN_AVG_VOLUME_30D,
+        ),
+        min_market_cap_usd=parse_universe_decimal(
+            form_value(form, "min_market_cap_usd"),
+            field_name="市值门槛",
+            default=stock_universe.DEFAULT_MIN_MARKET_CAP_USD,
+        ),
+        min_last_price=parse_universe_decimal(
+            form_value(form, "min_last_price"),
+            field_name="价格门槛",
+            default=stock_universe.DEFAULT_MIN_LAST_PRICE,
+        ),
+        allow_missing_market_cap=not form_bool(form, "require_market_cap"),
+        require_avg_volume_30d=not form_bool(form, "allow_missing_avg_volume"),
+    )
+
+
+def parse_stock_universe_exchanges(form: Mapping[str, list[str]]) -> tuple[str, ...]:
+    text = form_value(form, "exchanges")
+    exchanges = tuple(
+        exchange.strip().upper()
+        for exchange in text.split(",")
+        if exchange.strip()
+    )
+    return exchanges or stock_universe.DEFAULT_ALLOWED_EXCHANGES
+
+
+def format_stock_universe_import_message(
+    result: stock_universe.StockUniverseImportResult,
+) -> str:
+    mode = "预览" if result.dry_run else "写入"
+    message = (
+        f"股票池扩充{mode}完成：读取 {result.total_rows} 行，"
+        f"通过 {result.accepted_count} 行，剔除 {result.rejected_count} 行，"
+        f"写入 {result.upserted_count} 行。"
+    )
+    if result.rejection_reason_counts:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in list(result.rejection_reason_counts.items())[:5]
+        )
+        message += f" 剔除原因：{reasons}。"
+    return message
 
 
 def resolve_project_path(value: str) -> Path:
@@ -4880,6 +5544,7 @@ def layout(
         ("/topics", "主题", "热点与评分"),
         ("/reports", "报告", "分析输出"),
         ("/backtest", "复盘", "日报验证"),
+        ("/weather", "天气交易", "Polymarket"),
         ("/tasks", "同步", "数据任务"),
     ]
     nav_parts = []

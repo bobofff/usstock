@@ -13,6 +13,7 @@ from usstock.data import sec
 from usstock.db.migrations import main as migrations_main
 from usstock.discovery import daily as discovery
 from usstock.reports import daily_report
+from usstock.polymarket_weather import cli as weather_cli
 
 
 def main() -> int:
@@ -35,6 +36,8 @@ def main() -> int:
         return daily_report.main(argv[1:])
     if argv and argv[0] == "backtest":
         return backtest_main(argv[1:])
+    if argv and argv[0] == "weather":
+        return weather_cli.main(argv[1:])
 
     return migrations_main(argv)
 

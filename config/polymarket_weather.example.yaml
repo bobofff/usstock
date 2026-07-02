@@ -1,0 +1,59 @@
+# Polymarket weather trading module example config.
+# Copy this file and adjust settlement station/market fields for each market.
+
+cache_max_age_seconds: 900
+request_timeout_seconds: 30
+open_meteo_base_url: https://api.open-meteo.com
+gamma_base_url: https://gamma-api.polymarket.com
+clob_base_url: https://clob.polymarket.com
+
+cities:
+  shanghai:
+    name: Shanghai
+    latitude: 31.2304
+    longitude: 121.4737
+    timezone: Asia/Shanghai
+    settlement_station: "Configure to the exact Polymarket resolution source"
+    settlement_unit: C
+    weather_models:
+      - ecmwf_ifs025
+      - gfs_seamless
+      - ukmo_seamless
+    model_weights:
+      ecmwf_ifs025: 1.2
+      gfs_seamless: 1.0
+      ukmo_seamless: 1.0
+    model_error_std: 1.4
+    min_distribution_std: 0.8
+
+  new-york:
+    name: New York
+    latitude: 40.7128
+    longitude: -74.0060
+    timezone: America/New_York
+    settlement_station: "Central Park or market-specified station"
+    settlement_unit: F
+    weather_models:
+      - ecmwf_ifs025
+      - gfs_seamless
+      - ukmo_seamless
+      - nws
+    model_weights:
+      ecmwf_ifs025: 1.2
+      gfs_seamless: 1.0
+      ukmo_seamless: 1.0
+      nws: 0.8
+    model_error_std: 2.5
+    min_distribution_std: 1.0
+
+markets:
+  - city_id: new-york
+    target_date: "2026-07-03"
+    kind: high
+    market_query: "New York high temperature July 3"
+    fallback_buckets:
+      start: 75
+      end: 95
+      step: 1
+      unit: F
+      include_tails: true

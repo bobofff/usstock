@@ -14,6 +14,230 @@
 
 ---
 
+## Polymarket 天气交易模块
+
+本仓库新增了 `usstock.polymarket_weather` 子系统，用于研究 Polymarket 天气温度桶市场，重点支持每日最高温、最低温的区间桶交易。
+
+模块定位是“预测 + Edge + 仓位建议 + 交易日志 + 回测”，默认不自动下单。真实交易执行应在长期模拟盘稳定、合规确认和人工确认流程完善后再接入。
+
+### 功能范围
+
+* 支持任意城市配置：上海、香港、东京、纽约、伦敦只是内置示例，任何城市都可以通过经纬度、时区、结算站和结算单位扩展。
+* 支持多模型 Ensemble：Open-Meteo 数值预报模型，例如 `ecmwf_ifs025`、`gfs_seamless`、`ukmo_seamless`；美国城市可额外接入 `nws`。
+* 支持 Polymarket Gamma API 市场发现和 outcome 价格解析，并可选从 CLOB midpoint 刷新价格。
+* 自动解析常见温度桶 outcome，例如 `74 or below`、`75 to 76`、`90 or above`。
+* 使用 ensemble 均值、模型分歧和误差下限构造正态分布，输出每个温度桶的概率。
+* 计算 Edge：`我的概率 - 市场隐含概率`。
+* Kelly Criterion 仓位控制，支持 Full / Half / Quarter Kelly。
+* 内置单笔、单日、单市场、单城市风险敞口上限。
+* 本地 JSON 缓存、运行日志、CSV 交易日志和历史信号回测。
+
+### 目录结构
+
+```text
+src/usstock/polymarket_weather/
+  buckets.py       # 温度桶解析与生成
+  cache.py         # 本地 JSON TTL 缓存
+  cli.py           # usstock weather 命令行入口
+  config.py        # 城市、市场、API 配置
+  engine.py        # 预测引擎，整合天气、市场、概率和 Edge
+  market.py        # Polymarket Gamma / CLOB adapter
+  probability.py   # 温度概率分布
+  risk.py          # Kelly 仓位与风险上限
+  ledger.py        # CSV 交易日志与绩效统计
+  backtest.py      # 历史信号回测
+  weather.py       # Open-Meteo / NWS 天气源
+```
+
+示例配置文件：
+
+```text
+config/polymarket_weather.example.yaml
+```
+
+### 安装
+
+```bash
+python -m pip install -e .
+```
+
+依赖以免费、开源库为主。当前核心逻辑使用 Python 标准库；项目依赖包含 `pandas`、`pyyaml` 等。YAML 配置需要 `pyyaml`。
+
+### 快速运行
+
+控制面板入口：
+
+```bash
+usstock admin
+```
+
+打开本地控制面板后，左侧导航进入 **天气交易**。如果服务早已启动，需要重启 `usstock admin` 进程才能看到新入口。
+
+查看某城市某天 ensemble 预报：
+
+```bash
+usstock weather forecast --city new-york --date 2026-07-03 --kind high
+```
+
+查看 Polymarket 市场桶：
+
+```bash
+usstock weather market \
+  --city new-york \
+  --query "New York high temperature July 3"
+```
+
+生成 Edge + Kelly 仓位建议：
+
+```bash
+usstock weather signal \
+  --city new-york \
+  --date 2026-07-03 \
+  --kind high \
+  --query "New York high temperature July 3" \
+  --bankroll 1000 \
+  --kelly half \
+  --min-edge 0.03
+```
+
+手动计算一个 YES 桶仓位：
+
+```bash
+usstock weather size \
+  --outcome "85 to 86" \
+  --probability 0.38 \
+  --price 0.29 \
+  --bankroll 1000 \
+  --kelly quarter
+```
+
+记录 signal 输出里的最佳建议到本地交易日志：
+
+```bash
+usstock weather signal \
+  --city new-york \
+  --date 2026-07-03 \
+  --kind high \
+  --query "New York high temperature July 3" \
+  --record-best
+```
+
+查看本地绩效统计：
+
+```bash
+usstock weather performance
+```
+
+### 城市与结算站扩展
+
+每个城市建议显式配置：
+
+* `latitude` / `longitude`：天气 API 查询点。
+* `timezone`：目标城市时区。
+* `settlement_station`：Polymarket 结算规则指定的气象站或官方来源。
+* `settlement_unit`：`F` 或 `C`。
+* `weather_models`：模型列表，例如 `ecmwf_ifs025`、`gfs_seamless`、`ukmo_seamless`、`nws`。
+* `model_weights`：对特定模型加权，例如短临时提高 ECMWF 权重。
+* `model_error_std`：模型误差下限，避免 ensemble 过度自信。
+
+示例：
+
+```yaml
+cities:
+  shanghai:
+    name: Shanghai
+    latitude: 31.2304
+    longitude: 121.4737
+    timezone: Asia/Shanghai
+    settlement_station: "Configure to the exact Polymarket resolution source"
+    settlement_unit: C
+    weather_models:
+      - ecmwf_ifs025
+      - gfs_seamless
+      - ukmo_seamless
+    model_weights:
+      ecmwf_ifs025: 1.2
+    model_error_std: 1.4
+    min_distribution_std: 0.8
+```
+
+运行时指定配置：
+
+```bash
+usstock weather forecast \
+  --config config/polymarket_weather.example.yaml \
+  --city shanghai \
+  --date 2026-07-03 \
+  --kind high
+```
+
+### 回测
+
+历史回测使用 CSV 输入。最小字段：
+
+```csv
+city_id,target_date,kind,outcome,probability,market_price,settled_outcome,market_slug,token_id
+new-york,2026-07-01,high,80,0.60,0.50,true,nyc-high-temp,
+new-york,2026-07-02,high,81,0.60,0.50,false,nyc-high-temp,
+```
+
+运行：
+
+```bash
+usstock weather backtest \
+  --csv data/weather_backtest_sample.csv \
+  --bankroll 1000 \
+  --kelly half \
+  --min-edge 0.03
+```
+
+输出包含交易数、胜率、总盈亏、ROI、最大回撤和期末资金。
+
+### 风控逻辑
+
+YES 合约以 `price` 买入，若结算为 YES 支付 1。Full Kelly 投入资金比例为：
+
+```text
+full_kelly_fraction = (probability - price) / (1 - price)
+```
+
+系统随后应用：
+
+* `kelly_mode`：`full`、`half`、`quarter`。
+* `min_edge`：低于阈值不交易。
+* `max_trade_fraction`：单笔最大资金占比。
+* `max_daily_fraction`：单日最大新增敞口。
+* `max_market_fraction`：单市场最大敞口。
+* `max_city_fraction`：单城市最大敞口。
+
+### 数据源说明
+
+* Open-Meteo Forecast API：用于免费天气模型预报。
+* NWS API：用于美国城市的 National Weather Service 预报补充。
+* Polymarket Gamma API：用于发现市场、读取问题、outcomes、outcome prices 和 CLOB token ids。
+* Polymarket CLOB API：可选用于刷新 midpoint。
+
+相关官方文档：
+
+* Open-Meteo Forecast API: https://open-meteo.com/en/docs
+* Polymarket Gamma Markets API: https://docs.polymarket.com/developers/gamma-markets-api/get-markets
+* Polymarket CLOB Price API: https://docs.polymarket.com/developers/CLOB/prices-books/get-price
+
+### 测试
+
+```bash
+python -m unittest \
+  tests/test_polymarket_weather_buckets.py \
+  tests/test_polymarket_weather_probability.py \
+  tests/test_polymarket_weather_market.py \
+  tests/test_polymarket_weather_risk.py \
+  tests/test_polymarket_weather_backtest.py
+```
+
+这些测试不访问网络，覆盖核心交易逻辑。真实 API 调用建议单独做集成测试，并控制频率与缓存。
+
+---
+
 ## 可实现性结论
 
 整体思路 **可以实现**，但需要调整原始设想中的几个高风险点：

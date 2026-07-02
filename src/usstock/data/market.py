@@ -24,6 +24,7 @@ from psycopg.types.json import Jsonb
 
 from usstock.config.settings import PROJECT_ROOT, get_settings
 from usstock.db import migrations as db_migrations
+from usstock.screening import universe as stock_universe
 
 
 DEFAULT_DATA_SOURCE = "manual_csv"
@@ -1069,6 +1070,58 @@ def render_sync_result(result: MarketPriceSyncResult) -> str:
     return "\n".join(parts)
 
 
+def parse_non_negative_decimal_arg(
+    value: str | None,
+    *,
+    field_name: str,
+    default: Decimal,
+) -> Decimal:
+    if value is None or not value.strip():
+        return default
+    parsed = stock_universe.parse_decimal(value)
+    if parsed is None:
+        raise MarketDataError(f"{field_name} 必须是有效数字。")
+    if parsed < 0:
+        raise MarketDataError(f"{field_name} 不能小于 0。")
+    return parsed
+
+
+def build_universe_filter_config(args: argparse.Namespace) -> stock_universe.StockUniverseFilterConfig:
+    allowed_exchanges = tuple(
+        exchange.strip().upper()
+        for item in (args.exchange or [])
+        for exchange in item.split(",")
+        if exchange.strip()
+    ) or stock_universe.DEFAULT_ALLOWED_EXCHANGES
+    allowed_asset_types = tuple(
+        asset_type.strip().lower()
+        for item in (args.asset_type or [])
+        for asset_type in item.split(",")
+        if asset_type.strip()
+    ) or stock_universe.DEFAULT_ALLOWED_ASSET_TYPES
+    return stock_universe.StockUniverseFilterConfig(
+        min_avg_volume_30d=parse_non_negative_decimal_arg(
+            args.min_avg_volume_30d,
+            field_name="min-avg-volume-30d",
+            default=stock_universe.DEFAULT_MIN_AVG_VOLUME_30D,
+        ),
+        min_market_cap_usd=parse_non_negative_decimal_arg(
+            args.min_market_cap_usd,
+            field_name="min-market-cap-usd",
+            default=stock_universe.DEFAULT_MIN_MARKET_CAP_USD,
+        ),
+        min_last_price=parse_non_negative_decimal_arg(
+            args.min_last_price,
+            field_name="min-last-price",
+            default=stock_universe.DEFAULT_MIN_LAST_PRICE,
+        ),
+        allowed_exchanges=allowed_exchanges,
+        allowed_asset_types=allowed_asset_types,
+        allow_missing_market_cap=not args.require_market_cap,
+        require_avg_volume_30d=not args.allow_missing_avg_volume,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Import and manage market price data.")
     subparsers = parser.add_subparsers(dest="command")
@@ -1081,6 +1134,112 @@ def build_parser() -> argparse.ArgumentParser:
         "--data-source",
         default=DEFAULT_DATA_SOURCE,
         help="行情来源标识，默认 manual_csv",
+    )
+
+    universe_parser = subparsers.add_parser(
+        "import-universe",
+        help="从 CSV/JSONL 导入并扩充活跃美股股票池",
+    )
+    universe_parser.add_argument("file_path", type=Path, help="股票池 CSV 或 JSONL 文件路径")
+    universe_parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    universe_parser.add_argument(
+        "--data-source",
+        default=stock_universe.DEFAULT_UNIVERSE_DATA_SOURCE,
+        help="股票池来源标识，默认 active_universe_file",
+    )
+    universe_parser.add_argument("--source-url", help="原始数据源 URL，可选")
+    universe_parser.add_argument("--limit", type=int, help="只处理前 N 行，便于小批量验证")
+    universe_parser.add_argument("--dry-run", action="store_true", help="只预览过滤结果，不写入数据库")
+    universe_parser.add_argument(
+        "--min-avg-volume-30d",
+        default=str(stock_universe.DEFAULT_MIN_AVG_VOLUME_30D),
+        help="最低 30 日均量，默认 200000",
+    )
+    universe_parser.add_argument(
+        "--min-market-cap-usd",
+        default=str(stock_universe.DEFAULT_MIN_MARKET_CAP_USD),
+        help="最低美元市值，默认 100000000",
+    )
+    universe_parser.add_argument(
+        "--min-last-price",
+        default=str(stock_universe.DEFAULT_MIN_LAST_PRICE),
+        help="最低价格，默认 1",
+    )
+    universe_parser.add_argument(
+        "--exchange",
+        action="append",
+        default=[],
+        help="允许的交易所，可重复传入或逗号分隔，默认 NASDAQ,NYSE,AMEX",
+    )
+    universe_parser.add_argument(
+        "--asset-type",
+        action="append",
+        default=[],
+        help="允许的资产类型，可重复传入或逗号分隔，默认 equity,adr,reit",
+    )
+    universe_parser.add_argument(
+        "--require-market-cap",
+        action="store_true",
+        help="要求来源必须有市值；默认允许市值缺失后续补全",
+    )
+    universe_parser.add_argument(
+        "--allow-missing-avg-volume",
+        action="store_true",
+        help="允许成交量缺失；默认要求有 30 日均量",
+    )
+
+    nasdaq_universe_parser = subparsers.add_parser(
+        "sync-nasdaq-universe",
+        help="从 Nasdaq screener 接口预览或扩充活跃美股股票池",
+    )
+    nasdaq_universe_parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    nasdaq_universe_parser.add_argument("--limit", type=int, help="只处理前 N 行，便于小批量验证")
+    nasdaq_universe_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="写入数据库；默认只预览不写入",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--min-avg-volume-30d",
+        default=str(stock_universe.DEFAULT_MIN_AVG_VOLUME_30D),
+        help="最低 30 日均量，默认 200000",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--min-market-cap-usd",
+        default=str(stock_universe.DEFAULT_MIN_MARKET_CAP_USD),
+        help="最低美元市值，默认 100000000",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--min-last-price",
+        default=str(stock_universe.DEFAULT_MIN_LAST_PRICE),
+        help="最低价格，默认 1",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--exchange",
+        action="append",
+        default=[],
+        help="允许的交易所，可重复传入或逗号分隔，默认 NASDAQ,NYSE,AMEX",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--asset-type",
+        action="append",
+        default=[],
+        help="允许的资产类型，可重复传入或逗号分隔，默认 equity,adr,reit",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--require-market-cap",
+        action="store_true",
+        help="要求来源必须有市值；默认允许市值缺失后续补全",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--allow-missing-avg-volume",
+        action="store_true",
+        help="允许成交量缺失；默认使用接口成交量作为流动性代理",
+    )
+    nasdaq_universe_parser.add_argument(
+        "--no-volume-proxy",
+        action="store_true",
+        help="不把 Nasdaq volume 字段作为 avg_volume_30d 代理",
     )
 
     stooq_parser = subparsers.add_parser("sync-stooq", help="从 Stooq 免费日线接口同步价格")
@@ -1164,9 +1323,42 @@ def main(argv: list[str] | None = None) -> int:
             print(render_sync_result(result))
             return 0
 
+        if args.command == "import-universe":
+            result = stock_universe.import_stock_universe_file(
+                file_path=args.file_path,
+                database_url=args.database_url,
+                data_source=args.data_source,
+                source_url=args.source_url,
+                filter_config=build_universe_filter_config(args),
+                limit=args.limit,
+                dry_run=args.dry_run,
+            )
+            print(stock_universe.render_import_result(result))
+            return 0
+
+        if args.command == "sync-nasdaq-universe":
+            result = stock_universe.sync_nasdaq_stock_universe(
+                database_url=args.database_url,
+                filter_config=build_universe_filter_config(args),
+                limit=args.limit,
+                dry_run=not args.write,
+                exchanges=(
+                    tuple(
+                        exchange.strip().upper()
+                        for item in (args.exchange or [])
+                        for exchange in item.split(",")
+                        if exchange.strip()
+                    )
+                    or stock_universe.DEFAULT_ALLOWED_EXCHANGES
+                ),
+                use_volume_as_avg_volume=not args.no_volume_proxy,
+            )
+            print(stock_universe.render_import_result(result))
+            return 0
+
         parser.print_help()
         return 2
-    except MarketDataError as exc:
+    except (MarketDataError, stock_universe.StockUniverseError) as exc:
         print(f"行情数据导入失败: {exc}", file=sys.stderr)
         return 1
 

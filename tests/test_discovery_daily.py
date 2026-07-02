@@ -32,6 +32,26 @@ class RecordingConnection:
         return self
 
 
+class RowsCursor:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.rows = rows
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return self.rows
+
+
+class RowsConnection:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.rows = rows
+
+    def execute(
+        self,
+        sql: str,
+        params: tuple[object, ...] = (),
+    ) -> RowsCursor:
+        return RowsCursor(self.rows)
+
+
 class DiscoveryDailyTest(unittest.TestCase):
     def test_daily_discovery_migrates_before_opening_business_connection(self) -> None:
         events: list[tuple[str, str, bool | None]] = []
@@ -98,6 +118,37 @@ class DiscoveryDailyTest(unittest.TestCase):
 
         self.assertEqual(count, 10)
         self.assertEqual(events, ["migrate", "connect", "upsert"])
+
+    def test_fetch_stock_universe_reads_expanded_universe_fields(self) -> None:
+        conn = RowsConnection(
+            [
+                (
+                    "IONQ",
+                    "IonQ, Inc.",
+                    "Technology",
+                    "Computer Hardware",
+                    "Quantum computing systems",
+                    Decimal("1200000000"),
+                    Decimal("2500000"),
+                    True,
+                    False,
+                    False,
+                    False,
+                    "NYSE",
+                    "equity",
+                    "active_universe_file",
+                )
+            ]
+        )
+
+        result = daily.fetch_stock_universe(conn)  # type: ignore[arg-type]
+
+        self.assertIn("IONQ", result)
+        self.assertEqual(result["IONQ"]["company_name"], "IonQ, Inc.")
+        self.assertEqual(result["IONQ"]["avg_volume_30d"], Decimal("2500000"))
+        self.assertEqual(result["IONQ"]["exchange"], "NYSE")
+        self.assertEqual(result["IONQ"]["asset_type"], "equity")
+        self.assertEqual(result["IONQ"]["data_source"], "active_universe_file")
 
     def test_finnhub_mentions_map_news_to_ticker_and_topic(self) -> None:
         topic = daily.DEFAULT_MARKET_TOPICS[0]
