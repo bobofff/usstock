@@ -85,10 +85,15 @@ STOPWORDS = {
 }
 
 CATALYST_TERMS = {
+    "8-k": 5,
+    "acquisition": 5,
     "approval": 4,
     "approved": 4,
     "award": 3,
+    "awarded": 3,
     "beats": 3,
+    "buyout": 5,
+    "clinical": 3,
     "contract": 4,
     "deal": 3,
     "earnings": 3,
@@ -99,22 +104,58 @@ CATALYST_TERMS = {
     "lawsuit": 3,
     "merger": 5,
     "misses": 3,
-    "order": 3,
+    "order": 4,
     "partnership": 3,
+    "phase 3": 4,
+    "probe": 3,
     "raises": 3,
     "recall": 4,
     "restructuring": 3,
+    "subpoena": 3,
+    "takeover": 5,
+    "trial": 3,
     "upgrade": 3,
+    "wins": 4,
 }
 
 SEC_FORM_WEIGHTS = {
-    "8-K": Decimal("16"),
+    "8-K": Decimal("20"),
     "10-Q": Decimal("12"),
     "10-K": Decimal("12"),
     "S-1": Decimal("14"),
     "20-F": Decimal("10"),
-    "6-K": Decimal("9"),
+    "6-K": Decimal("10"),
 }
+
+COMPANY_SUFFIX_TERMS = {
+    "ag",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "limited",
+    "llc",
+    "ltd",
+    "nv",
+    "plc",
+}
+
+GENERIC_COMPANY_ALIASES = {
+    "advanced",
+    "american",
+    "first",
+    "global",
+    "international",
+    "new",
+    "technologies",
+    "technology",
+    "united",
+}
+
+MIN_AVG_VOLUME_FOR_CANDIDATE = Decimal("100000")
+LOW_MARKET_CAP_WARNING = Decimal("100000000")
 
 
 @dataclass(frozen=True)
@@ -155,6 +196,9 @@ class CandidateAccumulator:
     gdelt_article_urls: set[str] = field(default_factory=set)
     sec_accessions: set[str] = field(default_factory=set)
     sec_forms: Counter[str] = field(default_factory=Counter)
+    direct_finnhub_hits: int = 0
+    direct_gdelt_hits: int = 0
+    catalyst_terms: Counter[str] = field(default_factory=Counter)
     latest_news_at: datetime | None = None
     latest_filing_date: date | None = None
     recent_titles: list[str] = field(default_factory=list)
@@ -440,6 +484,110 @@ def normalize_text(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def contains_topic_term(text: str, term: str) -> bool:
+    key = term.strip().lower()
+    if not key:
+        return False
+
+    parts = re.findall(r"[a-z0-9]+", key)
+    if not parts:
+        return False
+
+    pattern = r"(?<![a-z0-9])" + r"[\W_]+".join(
+        re.escape(part) for part in parts
+    ) + r"(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def compact_company_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def company_aliases(company_name: str | None) -> tuple[str, ...]:
+    normalized = compact_company_phrase(str(company_name or ""))
+    if not normalized:
+        return ()
+
+    aliases: list[str] = []
+    tokens = normalized.split()
+    if len(normalized) >= 4:
+        aliases.append(normalized)
+
+    stripped_tokens = list(tokens)
+    while stripped_tokens and stripped_tokens[-1] in COMPANY_SUFFIX_TERMS:
+        stripped_tokens.pop()
+    stripped = " ".join(stripped_tokens)
+    if stripped and stripped != normalized and len(stripped) >= 4:
+        aliases.append(stripped)
+
+    if len(stripped_tokens) >= 2:
+        first_two = " ".join(stripped_tokens[:2])
+        if first_two not in aliases and len(first_two) >= 8:
+            aliases.append(first_two)
+        compact = "".join(stripped_tokens[:2])
+        if compact not in aliases and len(compact) >= 8:
+            aliases.append(compact)
+    elif len(stripped_tokens) == 1:
+        token = stripped_tokens[0]
+        if (
+            len(token) >= 5
+            and token not in STOPWORDS
+            and token not in GENERIC_COMPANY_ALIASES
+            and token not in aliases
+        ):
+            aliases.append(token)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for alias in aliases:
+        if alias in seen:
+            continue
+        seen.add(alias)
+        result.append(alias)
+    return tuple(result)
+
+
+def ticker_mentioned(text: str, ticker: str) -> bool:
+    symbol = ticker.strip().upper()
+    if not symbol:
+        return False
+
+    escaped = re.escape(symbol)
+    if len(symbol.replace("-", "")) >= 3:
+        pattern = rf"(?<![A-Z0-9])\$?{escaped}(?![A-Z0-9])"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+    strict_patterns = (
+        rf"(?<![A-Z0-9])\${escaped}(?![A-Z0-9])",
+        rf"\({escaped}\)",
+        rf"\b(?:NYSE|NASDAQ|AMEX|OTC|OTCMKTS|NYSEARCA)\s*:\s*{escaped}\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in strict_patterns)
+
+
+def match_company_mentions(
+    text: str,
+    *,
+    universe: dict[str, dict[str, Any]],
+    tickers: set[str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    search_tickers = tickers or set(universe)
+    matches: dict[str, tuple[str, ...]] = {}
+    for ticker in sorted(search_tickers):
+        matched: list[str] = []
+        if ticker_mentioned(text, ticker):
+            matched.append(f"ticker:{ticker}")
+
+        stock = universe.get(ticker, {})
+        for alias in company_aliases(stock.get("company_name")):
+            if contains_topic_term(text.lower(), alias):
+                matched.append(f"company:{alias}")
+
+        if matched:
+            matches[ticker] = tuple(matched)
+    return matches
+
+
 def extract_keywords(text: str, *, limit: int = 12) -> list[str]:
     words = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", text.lower())
     counter: Counter[str] = Counter()
@@ -457,9 +605,18 @@ def catalyst_score(text: str) -> Decimal:
     lower = normalize_text(text)
     total = Decimal("0")
     for term, weight in CATALYST_TERMS.items():
-        if term in lower:
+        if contains_topic_term(lower, term):
             total += Decimal(weight)
     return min(total, Decimal("12"))
+
+
+def matched_catalyst_terms(text: str) -> tuple[str, ...]:
+    lower = normalize_text(text)
+    return tuple(
+        term
+        for term in CATALYST_TERMS
+        if contains_topic_term(lower, term)
+    )
 
 
 def topic_match_score(topic: MarketTopic, text: str) -> tuple[Decimal, list[str]]:
@@ -467,13 +624,12 @@ def topic_match_score(topic: MarketTopic, text: str) -> tuple[Decimal, list[str]
     score = Decimal("0")
     matched: list[str] = []
     for keyword in topic.keywords:
-        key = keyword.lower()
-        if key in lower:
-            score += Decimal("2.5") if " " in key else Decimal("1.5")
+        if contains_topic_term(lower, keyword):
+            score += Decimal("2.5") if " " in keyword.strip() else Decimal("1.5")
             matched.append(keyword)
 
     for sector in topic.sectors:
-        if sector.lower() in lower:
+        if contains_topic_term(lower, sector):
             score += Decimal("1.0")
             matched.append(sector)
 
@@ -1133,20 +1289,50 @@ def build_finnhub_mentions(
 
         related = [normalize_ticker(ticker) for ticker in article.get("related_tickers", [])]
         related_tickers = [ticker for ticker in related if ticker]
+        if not related_tickers:
+            for topic, score, matched in matched_topics:
+                mentions.append(
+                    TopicMention(
+                        mention_uid=hash_uid(
+                            "finnhub_article",
+                            article["article_uid"],
+                            topic.topic_slug,
+                            "article",
+                        ),
+                        topic_slug=topic.topic_slug,
+                        ticker=None,
+                        source_type="finnhub_article",
+                        source_uid=article["article_uid"],
+                        source_title=article.get("headline"),
+                        source_url=article.get("article_url"),
+                        published_at=article.get("published_at"),
+                        relevance_score=score + catalyst_score(text),
+                        evidence={
+                            "matched": matched[:10],
+                            "keywords": article_keywords,
+                            "source": article.get("source_name"),
+                            "category": article.get("category"),
+                        },
+                    )
+                )
+
         for ticker in related_tickers:
             candidate = candidate_for(candidates, ticker, universe)
             candidate.finnhub_article_uids.add(article["article_uid"])
+            candidate.direct_finnhub_hits += 1
             candidate.latest_news_at = max_datetime(candidate.latest_news_at, article.get("published_at"))
             append_limited(candidate.recent_titles, article.get("headline"))
             for keyword in article_keywords:
                 candidate.keywords[keyword] += 1
+            for term in matched_catalyst_terms(text):
+                candidate.catalyst_terms[term] += 1
 
             topic_matches = matched_topics or [
                 (topic, Decimal("3"), ["ticker_hint"])
                 for topic in topic_by_hint.get(ticker, [])
             ]
             for topic, score, matched in topic_matches:
-                relevance = score + Decimal("4") + catalyst_score(text)
+                relevance = score + Decimal("6") + catalyst_score(text)
                 add_topic_signal(candidate, topic.topic_slug, relevance)
                 mentions.append(
                     TopicMention(
@@ -1166,7 +1352,9 @@ def build_finnhub_mentions(
                         relevance_score=relevance,
                         evidence={
                             "matched": matched[:10],
+                            "direct_match": "related_tickers",
                             "keywords": article_keywords,
+                            "catalysts": list(matched_catalyst_terms(text)),
                             "source": article.get("source_name"),
                             "category": article.get("category"),
                         },
@@ -1184,19 +1372,17 @@ def build_gdelt_mentions(
 ) -> list[TopicMention]:
     mentions: list[TopicMention] = []
     topics_by_query = {topic.gdelt_query: topic for topic in topics}
-    stock_texts = {
-        ticker: " ".join(
-            str(stock.get(key) or "")
-            for key in ("company_name", "sector", "industry", "business_description")
-        )
-        for ticker, stock in universe.items()
-    }
 
     for article in articles:
         topic = topics_by_query.get(article.get("query_text"))
         if not topic:
             continue
-        text = article.get("title") or ""
+        text = " ".join(
+            str(article.get(key) or "")
+            for key in ("title", "summary", "description", "content", "snippet")
+        )
+        article_keywords = extract_keywords(text, limit=8)
+        article_catalysts = matched_catalyst_terms(text)
         topic_score, matched = topic_match_score(topic, text)
         relevance = max(topic_score, Decimal("2")) + Decimal("1")
         mentions.append(
@@ -1212,27 +1398,63 @@ def build_gdelt_mentions(
                 relevance_score=relevance,
                 evidence={
                     "matched": matched[:10],
+                    "keywords": article_keywords,
+                    "catalysts": list(article_catalysts),
                     "domain": article.get("domain"),
                     "language": article.get("language"),
                     "source_country": article.get("source_country"),
+                    "topic_only": True,
                 },
             )
         )
 
-        mapped_tickers = set(topic.ticker_hints)
-        for ticker, stock_text in stock_texts.items():
-            score, _matched = topic_match_score(topic, stock_text)
-            if score >= Decimal("3"):
-                mapped_tickers.add(ticker)
-
-        for ticker in sorted(mapped_tickers):
-            if ticker not in universe and ticker not in topic.ticker_hints:
-                continue
+        search_tickers = set(universe) | set(topic.ticker_hints)
+        matched_tickers = match_company_mentions(
+            text,
+            universe=universe,
+            tickers=search_tickers,
+        )
+        for ticker, company_matches in matched_tickers.items():
             candidate = candidate_for(candidates, ticker, universe)
             candidate.gdelt_article_urls.add(article["article_url"])
+            candidate.direct_gdelt_hits += 1
             candidate.latest_news_at = max_datetime(candidate.latest_news_at, article.get("seen_at"))
             append_limited(candidate.gdelt_titles, article.get("title"))
-            add_topic_signal(candidate, topic.topic_slug, relevance)
+            for keyword in article_keywords:
+                candidate.keywords[keyword] += 1
+            for term in article_catalysts:
+                candidate.catalyst_terms[term] += 1
+
+            ticker_relevance = relevance + Decimal("6") + catalyst_score(text)
+            add_topic_signal(candidate, topic.topic_slug, ticker_relevance)
+            mentions.append(
+                TopicMention(
+                    mention_uid=hash_uid(
+                        "gdelt_article",
+                        article["article_url"],
+                        topic.topic_slug,
+                        ticker,
+                    ),
+                    topic_slug=topic.topic_slug,
+                    ticker=ticker,
+                    source_type="gdelt_article",
+                    source_uid=article["article_url"],
+                    source_title=article.get("title"),
+                    source_url=article.get("article_url"),
+                    published_at=article.get("seen_at"),
+                    relevance_score=ticker_relevance,
+                    evidence={
+                        "matched": matched[:10],
+                        "company_matches": list(company_matches),
+                        "keywords": article_keywords,
+                        "catalysts": list(article_catalysts),
+                        "domain": article.get("domain"),
+                        "language": article.get("language"),
+                        "source_country": article.get("source_country"),
+                        "topic_only": False,
+                    },
+                )
+            )
     return mentions
 
 
@@ -1257,6 +1479,8 @@ def build_sec_mentions(
             candidate.latest_filing_date = max_date(candidate.latest_filing_date, filing_date)
         title = f"{filing.get('form_type')} {filing.get('primary_doc_description') or filing.get('items') or ''}".strip()
         append_limited(candidate.sec_titles, title)
+        for term in matched_catalyst_terms(f"{title} {filing.get('items') or ''}"):
+            candidate.catalyst_terms[term] += 1
 
         stock = universe.get(ticker, {})
         stock_text = " ".join(
@@ -1325,12 +1549,28 @@ def score_candidate(
     gdelt_count = len(candidate.gdelt_article_urls)
     sec_count = len(candidate.sec_accessions)
 
-    news_score = Decimal(news_count * 8) + Decimal(min(sum(candidate.keywords.values()), 8))
-    for title in candidate.recent_titles:
-        news_score += catalyst_score(title)
-    news_score = min(news_score, Decimal("35"))
+    news_catalyst_score = sum(
+        (catalyst_score(title) for title in candidate.recent_titles),
+        Decimal("0"),
+    )
+    news_score = (
+        Decimal(news_count * 10)
+        + Decimal(candidate.direct_finnhub_hits * 4)
+        + Decimal(min(sum(candidate.keywords.values()), 6))
+        + min(news_catalyst_score, Decimal("20"))
+    )
+    news_score = min(news_score, Decimal("40"))
 
-    gdelt_score = min(Decimal(gdelt_count) * Decimal("0.7"), Decimal("20"))
+    gdelt_catalyst_score = sum(
+        (catalyst_score(title) for title in candidate.gdelt_titles),
+        Decimal("0"),
+    )
+    gdelt_score = min(
+        Decimal(gdelt_count) * Decimal("0.8")
+        + Decimal(candidate.direct_gdelt_hits * 6)
+        + min(gdelt_catalyst_score, Decimal("12")),
+        Decimal("18"),
+    )
 
     sec_score = Decimal("0")
     for form_type, count in candidate.sec_forms.items():
@@ -1344,30 +1584,55 @@ def score_candidate(
         fact_score = Decimal("6")
 
     liquidity_score = Decimal("0")
+    elasticity_score = Decimal("0")
+    liquidity_flags: list[str] = []
     market_cap = candidate.market_cap_usd
     volume = candidate.avg_volume_30d
     if market_cap is None:
         liquidity_score += Decimal("2")
-    elif market_cap >= Decimal("10000000000"):
-        liquidity_score += Decimal("8")
-    elif market_cap >= Decimal("1000000000"):
+        liquidity_flags.append("missing_market_cap")
+    elif market_cap >= Decimal("500000000000"):
+        liquidity_score += Decimal("4")
+        elasticity_score -= Decimal("4")
+        liquidity_flags.append("mega_cap_lower_elasticity")
+    elif market_cap >= Decimal("200000000000"):
+        liquidity_score += Decimal("5")
+        elasticity_score -= Decimal("2")
+        liquidity_flags.append("large_cap_lower_elasticity")
+    elif market_cap >= Decimal("20000000000"):
         liquidity_score += Decimal("6")
+        elasticity_score += Decimal("3")
+    elif market_cap >= Decimal("1000000000"):
+        liquidity_score += Decimal("7")
+        elasticity_score += Decimal("6")
     elif market_cap >= Decimal("300000000"):
-        liquidity_score += Decimal("3")
+        liquidity_score += Decimal("5")
+        elasticity_score += Decimal("4")
+    elif market_cap >= LOW_MARKET_CAP_WARNING:
+        liquidity_score += Decimal("2")
+        liquidity_flags.append("low_market_cap")
+    else:
+        liquidity_flags.append("very_low_market_cap")
 
     if volume is None:
         liquidity_score += Decimal("2")
-    elif volume >= Decimal("1000000"):
+        liquidity_flags.append("missing_avg_volume")
+    elif volume >= Decimal("5000000"):
         liquidity_score += Decimal("7")
+    elif volume >= Decimal("1000000"):
+        liquidity_score += Decimal("6")
     elif volume >= Decimal("250000"):
         liquidity_score += Decimal("4")
     elif volume >= Decimal("100000"):
         liquidity_score += Decimal("2")
+    else:
+        liquidity_flags.append("very_low_avg_volume")
+        elasticity_score -= Decimal("8")
     liquidity_score = min(liquidity_score, Decimal("15"))
 
     topic_strength = min(
-        Decimal(sum(candidate.topic_scores.values())) / Decimal("20"),
-        Decimal("8"),
+        Decimal(sum(candidate.topic_scores.values())) / Decimal("30"),
+        Decimal("6"),
     )
     score = (
         news_score
@@ -1376,8 +1641,9 @@ def score_candidate(
         + fact_score
         + liquidity_score
         + topic_strength
+        + elasticity_score
     )
-    score = min(score.quantize(Decimal("0.0001")), Decimal("100.0000"))
+    score = min(max(score, Decimal("0")).quantize(Decimal("0.0001")), Decimal("100.0000"))
 
     topics = tuple(
         topic
@@ -1397,6 +1663,11 @@ def score_candidate(
         "gdelt_titles": candidate.gdelt_titles,
         "sec_titles": candidate.sec_titles,
         "sec_forms": dict(candidate.sec_forms),
+        "direct_finnhub_hits": candidate.direct_finnhub_hits,
+        "direct_gdelt_hits": candidate.direct_gdelt_hits,
+        "catalyst_terms": dict(candidate.catalyst_terms),
+        "elasticity_score": str(elasticity_score.quantize(Decimal("0.0001"))),
+        "liquidity_flags": liquidity_flags,
         "topic_counts": dict(candidate.topic_counts),
         "topic_scores": dict(candidate.topic_scores),
         "market_cap_usd": str(market_cap) if market_cap is not None else None,
@@ -1427,6 +1698,13 @@ def score_candidate(
     )
 
 
+def has_minimum_liquidity(candidate: CandidateAccumulator) -> bool:
+    volume = candidate.avg_volume_30d
+    if volume is not None and volume < MIN_AVG_VOLUME_FOR_CANDIDATE:
+        return False
+    return True
+
+
 def rank_candidates(
     candidates: dict[str, CandidateAccumulator],
     *,
@@ -1439,6 +1717,7 @@ def rank_candidates(
         if candidate.finnhub_article_uids
         or candidate.gdelt_article_urls
         or candidate.sec_accessions
+        if has_minimum_liquidity(candidate)
     ]
     scored.sort(
         key=lambda item: (
@@ -1526,7 +1805,39 @@ def upsert_topic_mentions(conn: Connection, mentions: list[TopicMention]) -> int
     return count
 
 
-def upsert_candidate_scores(conn: Connection, scores: tuple[CandidateScore, ...]) -> int:
+def upsert_candidate_scores(
+    conn: Connection,
+    scores: tuple[CandidateScore, ...],
+    *,
+    run_date: date | None = None,
+) -> int:
+    target_run_date = run_date or (scores[0].run_date if scores else None)
+    if target_run_date is None:
+        return 0
+
+    score_dates = {score.run_date for score in scores}
+    if score_dates and score_dates != {target_run_date}:
+        raise ValueError("候选评分同步只支持同一个 run_date。")
+
+    current_tickers = [score.ticker for score in scores]
+    if current_tickers:
+        conn.execute(
+            """
+            DELETE FROM daily_candidate_scores
+            WHERE run_date = %s
+              AND NOT (ticker = ANY(%s))
+            """,
+            (target_run_date, current_tickers),
+        )
+    else:
+        conn.execute(
+            """
+            DELETE FROM daily_candidate_scores
+            WHERE run_date = %s
+            """,
+            (target_run_date,),
+        )
+
     count = 0
     for score in scores:
         conn.execute(
@@ -1950,7 +2261,7 @@ def run_daily_discovery(
                 detail=f"mentions={len(mentions)}",
                 message=f"主题提及保存完成：{len(mentions)} 条。",
             )
-            upsert_candidate_scores(conn, scores)
+            upsert_candidate_scores(conn, scores, run_date=run_date)
             emit_progress(
                 progress_callback,
                 stage="persist",

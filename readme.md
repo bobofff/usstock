@@ -396,14 +396,14 @@ usstock report daily --top-n 10 --use-llm --save-markdown
 
 日报生成后，可以把后续日线价格同步到 `market_daily_prices`，再计算日报候选股在 T+1、T+5、T+20 的实际表现。第一版默认使用“日报日之后第一个有价格的交易日收盘价”作为入场参考价，避免使用日报当天之后才知道的信息。
 
-默认使用 Stooq 免费日线 CSV 同步，适合对实时性要求不高的复盘场景：
+默认使用 `yfinance` 同步 Yahoo Finance 日线数据，适合原型、研究和复盘场景：
 
 ```bash
-usstock market sync-stooq --ticker AAPL --ticker NVDA --from-date 2026-06-01 --to-date 2026-06-22
-usstock market sync-stooq --from-report-candidates --from-date 2026-06-01 --to-date 2026-06-22 --top-n 10
+usstock market sync-yfinance --ticker AAPL --ticker NVDA --from-date 2026-06-01 --to-date 2026-06-22
+usstock market sync-yfinance --from-report-candidates --from-date 2026-06-01 --to-date 2026-06-22 --top-n 10
 ```
 
-如果免费接口临时不可用，也可以导入本地 CSV 日线价格：
+如果 Yahoo/yfinance 临时限流或不可用，也可以导入本地 CSV 日线价格：
 
 ```bash
 usstock market import-prices data/raw/prices.csv
@@ -416,7 +416,7 @@ CSV 支持常见列名：`ticker`/`symbol`、`date`、`open`、`high`、`low`、
 
 ```bash
 usstock backtest reports --from-date 2026-06-01 --to-date 2026-06-22 --top-n 10
-usstock backtest reports --from-date 2026-06-01 --to-date 2026-06-22 --price-source manual_csv
+usstock backtest reports --from-date 2026-06-01 --to-date 2026-06-22 --price-source yfinance
 ```
 
 复盘结果会写入 `daily_candidate_performance`，并在命令行输出整体胜率、平均收益、中位收益、平均回撤，以及按排名、评分区间和主题聚合后的 T+5 表现。

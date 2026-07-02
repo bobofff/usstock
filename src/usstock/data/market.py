@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ from usstock.db import migrations as db_migrations
 
 DEFAULT_DATA_SOURCE = "manual_csv"
 STOOQ_DATA_SOURCE = "stooq"
+YFINANCE_DATA_SOURCE = "yfinance"
 STOOQ_BASE_URL = "https://stooq.com/q/d/l/"
 DEFAULT_STOOQ_REQUESTS_PER_SECOND = 1.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
@@ -228,6 +229,65 @@ class StooqClient:
             ticker=normalize_ticker(ticker),
             symbol=symbol,
             request_url=url,
+        )
+
+
+class YFinanceClient:
+    """Small wrapper around yfinance daily history downloads."""
+
+    def daily_prices(
+        self,
+        *,
+        ticker: str,
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> list[DailyPrice]:
+        try:
+            import yfinance as yf
+        except ImportError as exc:
+            raise MarketDataError(
+                "缺少 yfinance 依赖，请先安装 yfinance 或运行项目依赖安装。"
+            ) from exc
+
+        normalized_ticker = normalize_ticker(ticker)
+        end_date = to_date + timedelta(days=1) if to_date else None
+        request_params = {
+            "ticker": normalized_ticker,
+            "start": from_date.isoformat() if from_date else "",
+            "end": end_date.isoformat() if end_date else "",
+            "interval": "1d",
+        }
+        try:
+            frame = yf.download(
+                normalized_ticker,
+                start=from_date.isoformat() if from_date else None,
+                end=end_date.isoformat() if end_date else None,
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+        except Exception as exc:
+            raise MarketDataError(f"yfinance 日线请求失败: {normalized_ticker}: {exc}") from exc
+
+        row_count = 0 if frame is None else len(frame)
+        write_market_sync_log(
+            "yfinance_response",
+            {
+                "ticker": normalized_ticker,
+                "rows": row_count,
+                "columns": [str(column) for column in getattr(frame, "columns", [])],
+                "from_date": from_date.isoformat() if from_date else "",
+                "to_date": to_date.isoformat() if to_date else "",
+            },
+        )
+        if frame is None or frame.empty:
+            return []
+
+        return parse_yfinance_prices(
+            frame,
+            ticker=normalized_ticker,
+            request_params=request_params,
         )
 
 
@@ -504,6 +564,119 @@ def parse_stooq_csv_prices(
     return prices
 
 
+def yfinance_column(frame: Any, field_name: str, ticker: str) -> Any:
+    columns = getattr(frame, "columns", [])
+    if field_name in columns:
+        return frame[field_name]
+    multi_key = (field_name, ticker)
+    if multi_key in columns:
+        return frame[multi_key]
+    if hasattr(columns, "nlevels") and columns.nlevels > 1:
+        try:
+            selected = frame.xs(field_name, level=0, axis=1)
+        except (KeyError, ValueError):
+            return None
+        if ticker in getattr(selected, "columns", []):
+            return selected[ticker]
+        if len(getattr(selected, "columns", [])) == 1:
+            return selected.iloc[:, 0]
+    return None
+
+
+def yfinance_decimal_value(
+    value: Any,
+    *,
+    field_name: str,
+    row_date: date,
+    required: bool = False,
+) -> Decimal | None:
+    if hasattr(value, "iloc"):
+        if getattr(value, "empty", False):
+            value = None
+        else:
+            value = value.iloc[0]
+    if value is None:
+        if required:
+            raise MarketDataError(f"yfinance {row_date} 缺少 {field_name}。")
+        return None
+    try:
+        if value != value:
+            if required:
+                raise MarketDataError(f"yfinance {row_date} 缺少 {field_name}。")
+            return None
+    except TypeError:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none"}:
+        if required:
+            raise MarketDataError(f"yfinance {row_date} 缺少 {field_name}。")
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation as exc:
+        raise MarketDataError(
+            f"yfinance {row_date} 的 {field_name} 不是有效数字: {value}"
+        ) from exc
+
+
+def parse_yfinance_prices(
+    frame: Any,
+    *,
+    ticker: str,
+    request_params: dict[str, str],
+) -> list[DailyPrice]:
+    normalized_ticker = normalize_ticker(ticker)
+    series_by_field = {
+        field_name: yfinance_column(frame, field_name, normalized_ticker)
+        for field_name in ("Open", "High", "Low", "Close", "Adj Close", "Volume")
+    }
+    close_series = series_by_field.get("Close")
+    if close_series is None:
+        raise MarketDataError("yfinance 返回缺少 Close 列。")
+
+    prices: list[DailyPrice] = []
+    for index in frame.index:
+        price_date = index.date() if hasattr(index, "date") else date.fromisoformat(str(index)[:10])
+        close_price = yfinance_decimal_value(
+            close_series.loc[index],
+            field_name="Close",
+            row_date=price_date,
+            required=True,
+        )
+        assert close_price is not None
+
+        def optional_value(field_name: str) -> Decimal | None:
+            series = series_by_field.get(field_name)
+            if series is None:
+                return None
+            return yfinance_decimal_value(
+                series.loc[index],
+                field_name=field_name,
+                row_date=price_date,
+            )
+
+        prices.append(
+            DailyPrice(
+                ticker=normalized_ticker,
+                price_date=price_date,
+                open_price=optional_value("Open"),
+                high_price=optional_value("High"),
+                low_price=optional_value("Low"),
+                close_price=close_price,
+                adjusted_close_price=optional_value("Adj Close"),
+                volume=optional_value("Volume"),
+                currency="USD",
+                data_source=YFINANCE_DATA_SOURCE,
+                source_uid=f"yfinance:{normalized_ticker}:{price_date.isoformat()}",
+                metadata={
+                    "provider": "yfinance",
+                    "request_params": dict(request_params),
+                },
+            )
+        )
+    return prices
+
+
 def upsert_daily_prices(conn: Connection, prices: list[DailyPrice]) -> int:
     for price in prices:
         conn.execute(
@@ -762,6 +935,128 @@ def sync_stooq_daily_prices(
     return result
 
 
+def sync_yfinance_daily_prices(
+    *,
+    database_url: str | None = None,
+    tickers: tuple[str, ...] = (),
+    from_date: date | None = None,
+    to_date: date | None = None,
+    from_report_candidates: bool = False,
+    profile: str = "default",
+    top_n: int = 10,
+    client: YFinanceClient | None = None,
+) -> MarketPriceSyncResult:
+    if from_date and to_date and to_date < from_date:
+        raise MarketDataError("结束日期不能早于开始日期。")
+    if top_n <= 0:
+        raise MarketDataError("top_n 必须大于 0。")
+
+    database_url = get_database_url(database_url)
+    ensure_market_schema(database_url)
+    client = client or YFinanceClient()
+    synced: list[str] = []
+    missing: list[str] = []
+    failed: list[str] = []
+    failure_messages: list[str] = []
+    total_count = 0
+
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        requested = resolve_stooq_sync_tickers(
+            conn,
+            tickers=tickers,
+            from_report_candidates=from_report_candidates,
+            start_date=from_date,
+            end_date=to_date,
+            profile=profile,
+            top_n=top_n,
+        )
+
+    write_market_sync_log(
+        "yfinance_sync_start",
+        {
+            "requested_tickers": list(requested),
+            "requested_count": len(requested),
+            "from_date": from_date.isoformat() if from_date else "",
+            "to_date": to_date.isoformat() if to_date else "",
+            "from_report_candidates": from_report_candidates,
+            "profile": profile,
+            "top_n": top_n,
+        },
+    )
+
+    prices_by_ticker: list[list[DailyPrice]] = []
+    for ticker in requested:
+        try:
+            prices = client.daily_prices(
+                ticker=ticker,
+                from_date=from_date,
+                to_date=to_date,
+            )
+        except MarketDataError as exc:
+            failed.append(ticker)
+            failure_messages.append(f"{ticker}: {exc}")
+            write_market_sync_log(
+                "yfinance_ticker_failed",
+                {
+                    "ticker": ticker,
+                    "error": str(exc),
+                },
+            )
+            continue
+        if not prices:
+            missing.append(ticker)
+            write_market_sync_log(
+                "yfinance_ticker_missing",
+                {
+                    "ticker": ticker,
+                },
+            )
+            continue
+        prices_by_ticker.append(prices)
+        synced.append(ticker)
+        write_market_sync_log(
+            "yfinance_ticker_synced",
+            {
+                "ticker": ticker,
+                "price_count": len(prices),
+                "first_price_date": prices[0].price_date.isoformat(),
+                "last_price_date": prices[-1].price_date.isoformat(),
+            },
+        )
+
+    with psycopg.connect(database_url, autocommit=False) as conn:
+        with conn.transaction():
+            for prices in prices_by_ticker:
+                total_count += upsert_daily_prices(conn, prices)
+
+    result = MarketPriceSyncResult(
+        provider=YFINANCE_DATA_SOURCE,
+        requested_tickers=requested,
+        synced_tickers=tuple(synced),
+        missing_tickers=tuple(missing),
+        price_count=total_count,
+        from_date=from_date,
+        to_date=to_date,
+        failed_tickers=tuple(failed),
+        failure_messages=tuple(failure_messages),
+    )
+    write_market_sync_log(
+        "yfinance_sync_result",
+        {
+            "requested_count": len(result.requested_tickers),
+            "synced_count": len(result.synced_tickers),
+            "missing_count": len(result.missing_tickers),
+            "failed_count": len(result.failed_tickers),
+            "price_count": result.price_count,
+            "synced_tickers": list(result.synced_tickers[:20]),
+            "missing_tickers": list(result.missing_tickers[:20]),
+            "failed_tickers": list(result.failed_tickers[:20]),
+            "failure_messages": list(result.failure_messages[:20]),
+        },
+    )
+    return result
+
+
 def render_sync_result(result: MarketPriceSyncResult) -> str:
     parts = [
         f"[完成] {result.provider} 日线同步：价格 {result.price_count} 行，"
@@ -805,6 +1100,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stooq_parser.add_argument("--profile", default="default", help="日报 profile")
     stooq_parser.add_argument("--top-n", type=int, default=10, help="每份日报取前 N 个候选")
+
+    yfinance_parser = subparsers.add_parser(
+        "sync-yfinance",
+        help="从 Yahoo Finance/yfinance 同步日线价格",
+    )
+    yfinance_parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL")
+    yfinance_parser.add_argument(
+        "--ticker",
+        action="append",
+        default=[],
+        help="股票代码，可重复传入，也可用逗号分隔",
+    )
+    yfinance_parser.add_argument("--from-date", help="开始日期，格式 YYYY-MM-DD")
+    yfinance_parser.add_argument("--to-date", help="结束日期，格式 YYYY-MM-DD")
+    yfinance_parser.add_argument(
+        "--from-report-candidates",
+        action="store_true",
+        help="从已生成日报候选中自动提取 ticker",
+    )
+    yfinance_parser.add_argument("--profile", default="default", help="日报 profile")
+    yfinance_parser.add_argument("--top-n", type=int, default=10, help="每份日报取前 N 个候选")
     return parser
 
 
@@ -824,6 +1140,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "sync-stooq":
             result = sync_stooq_daily_prices(
+                database_url=args.database_url,
+                tickers=parse_ticker_list(args.ticker),
+                from_date=parse_optional_date(args.from_date, field_name="from-date"),
+                to_date=parse_optional_date(args.to_date, field_name="to-date"),
+                from_report_candidates=args.from_report_candidates,
+                profile=args.profile,
+                top_n=args.top_n,
+            )
+            print(render_sync_result(result))
+            return 0
+
+        if args.command == "sync-yfinance":
+            result = sync_yfinance_daily_prices(
                 database_url=args.database_url,
                 tickers=parse_ticker_list(args.ticker),
                 from_date=parse_optional_date(args.from_date, field_name="from-date"),

@@ -783,7 +783,6 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                     run_date=run_date,
                     profile=profile,
                     top_n=top_n,
-                    use_llm=form_bool(form, "use_llm"),
                 )
                 report_href = "/reports?uid=" + urllib.parse.quote(report.report_uid)
                 self.redirect(
@@ -812,6 +811,32 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/actions/market-sync-stooq":
                 result = market.sync_stooq_daily_prices(
+                    database_url=database_url,
+                    tickers=market.parse_ticker_list(form_value(form, "tickers")),
+                    from_date=market.parse_optional_date(
+                        form_value(form, "from_date"),
+                        field_name="开始日期",
+                    ),
+                    to_date=market.parse_optional_date(
+                        form_value(form, "to_date"),
+                        field_name="结束日期",
+                    ),
+                    from_report_candidates=form_bool(form, "from_report_candidates"),
+                    profile=form_value(form, "profile") or backtest_engine.DEFAULT_PROFILE,
+                    top_n=(
+                        parse_positive_int(form_value(form, "top_n"))
+                        or backtest_engine.DEFAULT_TOP_N
+                    ),
+                )
+                self.redirect(
+                    safe_return_path(form, "/backtest"),
+                    format_market_sync_result_message(result),
+                    ok=market_sync_notice_is_ok(result),
+                )
+                return
+
+            if parsed.path == "/actions/market-sync-yfinance":
+                result = market.sync_yfinance_daily_prices(
                     database_url=database_url,
                     tickers=market.parse_ticker_list(form_value(form, "tickers")),
                     from_date=market.parse_optional_date(
@@ -1215,6 +1240,7 @@ def action_fallback_path(
     if action_path in {
         "/actions/market-import-prices",
         "/actions/market-sync-stooq",
+        "/actions/market-sync-yfinance",
         "/actions/backtest-reports",
     }:
         return safe_return_path(form, "/backtest")
@@ -1498,10 +1524,25 @@ def render_dashboard(
             recent_articles = (
                 fetch_all(
                     conn,
-                    """
-                    SELECT title, domain, language, seen_at, article_url
-                    FROM gdelt_articles
-                    ORDER BY coalesce(seen_at, last_seen_at) DESC
+                    f"""
+                    SELECT ga.title, ga.domain, ga.language, ga.seen_at,
+                           ga.article_url,
+                           {(
+                               "coalesce(array_remove(array_agg(DISTINCT tm.topic_slug ORDER BY tm.topic_slug), NULL), '{}'::text[])"
+                               if tables["topic_mentions"]
+                               else "'{}'::text[]"
+                           )} AS topic_slugs
+                    FROM gdelt_articles ga
+                    {(
+                        "LEFT JOIN topic_mentions tm "
+                        "ON tm.source_type = 'gdelt_article' "
+                        "AND tm.source_uid = ga.article_url"
+                        if tables["topic_mentions"]
+                        else ""
+                    )}
+                    GROUP BY ga.title, ga.domain, ga.language, ga.seen_at,
+                             ga.article_url, ga.last_seen_at
+                    ORDER BY coalesce(ga.seen_at, ga.last_seen_at) DESC
                     LIMIT 8
                     """,
                 )
@@ -1511,11 +1552,26 @@ def render_dashboard(
             recent_finnhub_articles = (
                 fetch_all(
                     conn,
-                    """
-                    SELECT headline, source_name, category, related_tickers,
-                           published_at, article_url
-                    FROM finnhub_articles
-                    ORDER BY coalesce(published_at, last_seen_at) DESC
+                    f"""
+                    SELECT fa.headline, fa.source_name, fa.category,
+                           fa.related_tickers, fa.published_at, fa.article_url,
+                           {(
+                               "coalesce(array_remove(array_agg(DISTINCT tm.topic_slug ORDER BY tm.topic_slug), NULL), '{}'::text[])"
+                               if tables["topic_mentions"]
+                               else "'{}'::text[]"
+                           )} AS topic_slugs
+                    FROM finnhub_articles fa
+                    {(
+                        "LEFT JOIN topic_mentions tm "
+                        "ON tm.source_type = 'finnhub_article' "
+                        "AND tm.source_uid = fa.article_uid"
+                        if tables["topic_mentions"]
+                        else ""
+                    )}
+                    GROUP BY fa.headline, fa.source_name, fa.category,
+                             fa.related_tickers, fa.published_at, fa.article_url,
+                             fa.last_seen_at
+                    ORDER BY coalesce(fa.published_at, fa.last_seen_at) DESC
                     LIMIT 8
                     """,
                 )
@@ -1740,6 +1796,19 @@ def render_gdelt(
         with connect_database(database_url) as conn:
             has_articles = table_exists(conn, "gdelt_articles")
             has_queries = table_exists(conn, "gdelt_doc_queries")
+            has_mentions = table_exists(conn, "topic_mentions")
+            topic_select = (
+                "coalesce(array_remove(array_agg(DISTINCT tm.topic_slug ORDER BY tm.topic_slug), NULL), '{}'::text[])"
+                if has_mentions
+                else "'{}'::text[]"
+            )
+            topic_join = (
+                "LEFT JOIN topic_mentions tm "
+                "ON tm.source_type = 'gdelt_article' "
+                "AND tm.source_uid = ga.article_url"
+                if has_mentions
+                else ""
+            )
             article_conditions: list[str] = []
             article_params: list[Any] = []
             query_conditions: list[str] = []
@@ -1749,8 +1818,8 @@ def render_gdelt(
                 article_conditions.append(
                     """
                     (
-                        title ILIKE %s OR query_text ILIKE %s
-                        OR coalesce(domain, '') ILIKE %s
+                        ga.title ILIKE %s OR ga.query_text ILIKE %s
+                        OR coalesce(ga.domain, '') ILIKE %s
                     )
                     """
                 )
@@ -1770,11 +1839,16 @@ def render_gdelt(
                 fetch_all(
                     conn,
                     f"""
-                    SELECT title, domain, language, source_country, tone,
-                           seen_at, article_url, query_text
-                    FROM gdelt_articles
+                    SELECT ga.title, ga.domain, ga.language, ga.source_country,
+                           ga.tone, ga.seen_at, ga.article_url, ga.query_text,
+                           {topic_select} AS topic_slugs
+                    FROM gdelt_articles ga
+                    {topic_join}
                     {article_where}
-                    ORDER BY coalesce(seen_at, last_seen_at) DESC
+                    GROUP BY ga.title, ga.domain, ga.language, ga.source_country,
+                             ga.tone, ga.seen_at, ga.article_url, ga.query_text,
+                             ga.last_seen_at
+                    ORDER BY coalesce(ga.seen_at, ga.last_seen_at) DESC
                     """,
                     tuple(article_params),
                 )
@@ -1834,6 +1908,19 @@ def render_finnhub(
         with connect_database(database_url) as conn:
             has_articles = table_exists(conn, "finnhub_articles")
             has_queries = table_exists(conn, "finnhub_news_queries")
+            has_mentions = table_exists(conn, "topic_mentions")
+            topic_select = (
+                "coalesce(array_remove(array_agg(DISTINCT tm.topic_slug ORDER BY tm.topic_slug), NULL), '{}'::text[])"
+                if has_mentions
+                else "'{}'::text[]"
+            )
+            topic_join = (
+                "LEFT JOIN topic_mentions tm "
+                "ON tm.source_type = 'finnhub_article' "
+                "AND tm.source_uid = fa.article_uid"
+                if has_mentions
+                else ""
+            )
             summary = (
                 fetch_one(
                     conn,
@@ -1894,19 +1981,19 @@ def render_finnhub(
                 article_conditions.append(
                     """
                     (
-                        headline ILIKE %s OR coalesce(summary, '') ILIKE %s
-                        OR coalesce(source_name, '') ILIKE %s
+                        fa.headline ILIKE %s OR coalesce(fa.summary, '') ILIKE %s
+                        OR coalesce(fa.source_name, '') ILIKE %s
                     )
                     """
                 )
                 article_params.extend([like, like, like])
             if ticker:
-                article_conditions.append("%s = ANY(related_tickers)")
+                article_conditions.append("%s = ANY(fa.related_tickers)")
                 article_params.append(ticker)
                 query_conditions.append("upper(coalesce(ticker, '')) = upper(%s)")
                 query_params.append(ticker)
             if category:
-                article_conditions.append("lower(coalesce(category, '')) = lower(%s)")
+                article_conditions.append("lower(coalesce(fa.category, '')) = lower(%s)")
                 article_params.append(category)
                 query_conditions.append("lower(coalesce(category, '')) = lower(%s)")
                 query_params.append(category)
@@ -1923,11 +2010,17 @@ def render_finnhub(
                 fetch_all(
                     conn,
                     f"""
-                    SELECT headline, source_name, category, related_tickers,
-                           published_at, article_url, endpoint
-                    FROM finnhub_articles
+                    SELECT fa.headline, fa.source_name, fa.category,
+                           fa.related_tickers, fa.published_at, fa.article_url,
+                           fa.endpoint,
+                           {topic_select} AS topic_slugs
+                    FROM finnhub_articles fa
+                    {topic_join}
                     {article_where}
-                    ORDER BY coalesce(published_at, last_seen_at) DESC
+                    GROUP BY fa.headline, fa.source_name, fa.category,
+                             fa.related_tickers, fa.published_at, fa.article_url,
+                             fa.endpoint, fa.last_seen_at
+                    ORDER BY coalesce(fa.published_at, fa.last_seen_at) DESC
                     """,
                     tuple(article_params),
                 )
@@ -2475,7 +2568,7 @@ def render_reports(
 
     metrics = [
         metric_box("报告总数", summary.get("total"), f"今日 {fmt(summary.get('today'))}"),
-        metric_box("LLM 增强", summary.get("llm_used"), "可选摘要增强"),
+        metric_box("LLM 增强", summary.get("llm_used"), "默认启用"),
         metric_box("最近生成", summary.get("last_generated_at"), "daily_analysis_reports"),
     ]
 
@@ -2506,9 +2599,6 @@ def render_reports(
               <label>运行日期 <input name="run_date" type="date" value="{today.isoformat()}"></label>
               <label>profile <input name="profile" value="{e(daily_report.DEFAULT_PROFILE)}"></label>
               <label>候选数量 <input name="top_n" type="number" min="1" value="{daily_report.DEFAULT_TOP_N}"></label>
-            </div>
-            <div class="checkbox-stack">
-              <label><input type="checkbox" name="use_llm" value="1"> 使用 LLM 增强摘要和风险提示</label>
             </div>
           </div>
         </div>
@@ -2701,10 +2791,10 @@ def render_backtest_workspace(
 def render_backtest_forms(*, today: date, from_date: date, return_path: str) -> str:
     return f"""
     <section class="task-grid">
-      <form method="post" action="/actions/market-sync-stooq">
+      <form method="post" action="/actions/market-sync-yfinance">
         <input type="hidden" name="return_path" value="{e(return_path)}">
         <h2>自动同步日线价格</h2>
-        <p>默认从已生成日报候选中提取 ticker，并从 Stooq 同步免费日线数据。</p>
+        <p>默认从已生成日报候选中提取 ticker，并通过 yfinance 同步 Yahoo Finance 日线数据。</p>
         <label>开始日期 <input name="from_date" type="date" value="{from_date.isoformat()}" required></label>
         <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}" required></label>
         <label>指定 ticker <input name="tickers" placeholder="可空；如 AAPL,NVDA,MSFT"></label>
@@ -2721,7 +2811,7 @@ def render_backtest_forms(*, today: date, from_date: date, return_path: str) -> 
         <label>结束日期 <input name="to_date" type="date" value="{today.isoformat()}" required></label>
         <label>profile <input name="profile" value="{e(backtest_engine.DEFAULT_PROFILE)}"></label>
         <label>每份日报前 N 个 <input name="top_n" type="number" min="1" value="{backtest_engine.DEFAULT_TOP_N}"></label>
-        <label>价格来源 <input name="price_source" value="{e(market.STOOQ_DATA_SOURCE)}"></label>
+        <label>价格来源 <input name="price_source" value="{e(market.YFINANCE_DATA_SOURCE)}"></label>
         <label><input type="checkbox" name="no_persist" value="1"> 只预览，不写入复盘表</label>
         <button class="primary" type="submit">运行复盘</button>
       </form>
@@ -3506,11 +3596,21 @@ def render_articles_table(rows: list[dict[str, Any]], *, compact: bool = False) 
         url = row.get("article_url")
         if url:
             title = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{title}</a>'
-        extra = "" if compact else f"<td>{e(row.get('query_text'))}</td><td>{fmt(row.get('tone'))}</td>"
+        topics = format_topic_badges(row.get("topic_slugs"))
+        compact_topics = "" if topics == "-" else f"<div>{topics}</div>"
+        extra = (
+            ""
+            if compact
+            else (
+                f"<td>{topics}</td>"
+                f"<td>{e(row.get('query_text'))}</td>"
+                f"<td>{fmt(row.get('tone'))}</td>"
+            )
+        )
         body.append(
             f"""
             <tr>
-              <td>{title}<div class="subtle">{e(row.get("domain"))}</div></td>
+              <td>{title}<div class="subtle">{e(row.get("domain"))}</div>{compact_topics if compact else ""}</td>
               <td>{e(row.get("language"))}</td>
               <td>{e(row.get("source_country"))}</td>
               <td>{fmt(row.get("seen_at"))}</td>
@@ -3522,7 +3622,7 @@ def render_articles_table(rows: list[dict[str, Any]], *, compact: bool = False) 
     if compact:
         head = "<tr><th>标题</th><th>语言</th><th>地区</th><th>时间</th></tr>"
     else:
-        head = "<tr><th>标题</th><th>语言</th><th>地区</th><th>时间</th><th>query</th><th>tone</th></tr>"
+        head = "<tr><th>标题</th><th>语言</th><th>地区</th><th>时间</th><th>主题</th><th>query</th><th>tone</th></tr>"
     return table(head, "".join(body))
 
 
@@ -3541,6 +3641,8 @@ def render_finnhub_articles_table(
         if url:
             title = f'<a href="{e(url)}" target="_blank" rel="noreferrer">{title}</a>'
         related = format_ticker_list(row.get("related_tickers"))
+        topics = format_topic_badges(row.get("topic_slugs"))
+        compact_topics = "" if topics == "-" else f"<div>{topics}</div>"
         source = row.get("source_name") or "-"
         extra = (
             ""
@@ -3548,6 +3650,7 @@ def render_finnhub_articles_table(
             else (
                 f"<td>{e(row.get('category'))}</td>"
                 f"<td>{related}</td>"
+                f"<td>{topics}</td>"
                 f"<td>{e(row.get('endpoint'))}</td>"
             )
         )
@@ -3555,7 +3658,7 @@ def render_finnhub_articles_table(
             body.append(
                 f"""
                 <tr>
-                  <td>{title}<div class="subtle">{e(row.get("category"))}</div></td>
+                  <td>{title}<div class="subtle">{e(row.get("category"))}</div>{compact_topics}</td>
                   <td>{e(source)}</td>
                   <td>{related}</td>
                   <td>{fmt(row.get("published_at"))}</td>
@@ -3578,7 +3681,7 @@ def render_finnhub_articles_table(
         head = "<tr><th>标题</th><th>来源</th><th>相关</th><th>时间</th></tr>"
     else:
         head = (
-            "<tr><th>标题</th><th>来源</th><th>分类</th><th>相关</th>"
+            "<tr><th>标题</th><th>来源</th><th>分类</th><th>相关</th><th>主题</th>"
             "<th>接口</th><th>时间</th></tr>"
         )
     return table(head, "".join(body))
@@ -4214,6 +4317,28 @@ def format_ticker_list(value: Any) -> str:
     if not tickers:
         return "-"
     return e(", ".join(tickers[:8]))
+
+
+def format_topic_badges(value: Any, *, limit: int = 5) -> str:
+    if isinstance(value, str):
+        topics = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list | tuple):
+        topics = [str(item).strip() for item in value]
+    else:
+        topics = []
+    topics = [topic for topic in topics if topic]
+    if not topics:
+        return "-"
+
+    unique_topics = list(dict.fromkeys(topics))
+    clipped = unique_topics[:limit]
+    badges = [
+        f'<span class="badge topic">{e(topic)}</span>'
+        for topic in clipped
+    ]
+    if len(unique_topics) > limit:
+        badges.append(f'<span class="badge muted">+{len(unique_topics) - limit}</span>')
+    return f'<span class="topic-badges">{"".join(badges)}</span>'
 
 
 def format_list(value: Any, *, limit: int = 8) -> str:
@@ -6136,6 +6261,19 @@ def layout(
     .badge.error {{
       background: var(--notice-error-bg);
       color: var(--error);
+    }}
+    .badge.topic {{
+      background: var(--badge-ok-bg);
+      color: var(--ok);
+    }}
+    .topic-badges {{
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+      max-width: 280px;
+      margin-top: 4px;
+      vertical-align: middle;
     }}
     .report-preview {{
       max-height: 680px;

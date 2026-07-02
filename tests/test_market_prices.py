@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 from usstock.data import market
 
 
@@ -60,6 +62,30 @@ class _FakeStooqClient:
                 price_date=date(2026, 6, 2),
                 close_price=Decimal("100"),
                 data_source=market.STOOQ_DATA_SOURCE,
+            )
+        ]
+
+
+class _FakeYFinanceClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def daily_prices(
+        self,
+        *,
+        ticker: str,
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> list[market.DailyPrice]:
+        self.calls.append(ticker)
+        if ticker == "AMZN":
+            raise market.MarketDataError("temporary yahoo limit")
+        return [
+            market.DailyPrice(
+                ticker=ticker,
+                price_date=date(2026, 6, 2),
+                close_price=Decimal("100"),
+                data_source=market.YFINANCE_DATA_SOURCE,
             )
         ]
 
@@ -180,6 +206,34 @@ class MarketPriceImportTest(unittest.TestCase):
 
         self.assertIn("浏览器 JavaScript 验证页", str(raised.exception))
 
+    def test_parse_yfinance_prices_maps_multiindex_ohlcv_rows(self) -> None:
+        frame = pd.DataFrame(
+            {
+                ("Open", "NVDA"): [Decimal("215.73")],
+                ("High", "NVDA"): [Decimal("224.87")],
+                ("Low", "NVDA"): [Decimal("215.70")],
+                ("Close", "NVDA"): [Decimal("224.36")],
+                ("Adj Close", "NVDA"): [Decimal("224.09")],
+                ("Volume", "NVDA"): [212850700],
+            },
+            index=pd.to_datetime(["2026-06-01"]),
+        )
+
+        prices = market.parse_yfinance_prices(
+            frame,
+            ticker="NVDA",
+            request_params={"ticker": "NVDA", "start": "2026-06-01"},
+        )
+
+        self.assertEqual(len(prices), 1)
+        self.assertEqual(prices[0].ticker, "NVDA")
+        self.assertEqual(prices[0].price_date, date(2026, 6, 1))
+        self.assertEqual(prices[0].close_price, Decimal("224.36"))
+        self.assertEqual(prices[0].adjusted_close_price, Decimal("224.09"))
+        self.assertEqual(prices[0].volume, Decimal("212850700"))
+        self.assertEqual(prices[0].data_source, market.YFINANCE_DATA_SOURCE)
+        self.assertEqual(prices[0].source_uid, "yfinance:NVDA:2026-06-01")
+
     def test_sync_stooq_daily_prices_continues_after_ticker_failure(self) -> None:
         client = _FakeStooqClient()
         tickers = ("AAPL", "AMZN", "MSFT")
@@ -194,6 +248,25 @@ class MarketPriceImportTest(unittest.TestCase):
             result = market.sync_stooq_daily_prices(tickers=tickers, client=client)
 
         self.assertEqual(client.calls, ["AAPL", "AMZN", "MSFT"])
+        self.assertEqual(result.synced_tickers, ("AAPL", "MSFT"))
+        self.assertEqual(result.failed_tickers, ("AMZN",))
+        self.assertEqual(result.price_count, 2)
+
+    def test_sync_yfinance_daily_prices_continues_after_ticker_failure(self) -> None:
+        client = _FakeYFinanceClient()
+        tickers = ("AAPL", "AMZN", "MSFT")
+
+        with (
+            patch.object(market, "get_database_url", return_value="postgresql://local/test"),
+            patch.object(market, "ensure_market_schema", return_value=0),
+            patch.object(market.psycopg, "connect", return_value=_FakeConnection()),
+            patch.object(market, "resolve_stooq_sync_tickers", return_value=tickers),
+            patch.object(market, "upsert_daily_prices", side_effect=lambda conn, prices: len(prices)),
+        ):
+            result = market.sync_yfinance_daily_prices(tickers=tickers, client=client)
+
+        self.assertEqual(client.calls, ["AAPL", "AMZN", "MSFT"])
+        self.assertEqual(result.provider, market.YFINANCE_DATA_SOURCE)
         self.assertEqual(result.synced_tickers, ("AAPL", "MSFT"))
         self.assertEqual(result.failed_tickers, ("AMZN",))
         self.assertEqual(result.price_count, 2)

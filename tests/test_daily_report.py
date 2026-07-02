@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 from usstock.reports import daily_report
 
@@ -25,6 +27,30 @@ class QueryResult:
 
 
 class DailyReportTest(unittest.TestCase):
+    def test_llm_option_removed_and_default_enabled(self) -> None:
+        self.assertNotIn(
+            "use_llm",
+            inspect.signature(daily_report.generate_daily_report).parameters,
+        )
+
+        args = daily_report.build_parser().parse_args(
+            ["daily", "--llm-model", "example-model"]
+        )
+
+        self.assertFalse(hasattr(args, "use_llm"))
+
+        def stop_after_config(**kwargs: object) -> daily_report.LLMConfig:
+            self.assertIs(kwargs["enabled"], True)
+            raise RuntimeError("stop after config")
+
+        with (
+            patch.object(daily_report, "get_database_url", return_value="postgresql://example/report"),
+            patch.object(daily_report, "ensure_report_schema"),
+            patch.object(daily_report, "llm_config_from_settings", side_effect=stop_after_config),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after config"):
+                daily_report.generate_daily_report(database_url="postgresql://example/report")
+
     def test_build_candidate_analysis_from_score_payload(self) -> None:
         candidate = {
             "rank": 1,
@@ -126,6 +152,7 @@ class DailyReportTest(unittest.TestCase):
         )
 
         self.assertIn("不构成投资建议", report.markdown_body)
+        self.assertIn("## 短线机会候选", report.markdown_body)
         self.assertIn("AAPL", report.markdown_body)
         self.assertIn("https://example.com/aapl", report.markdown_body)
         self.assertIn("新闻驱动但基本面证据不足", "\n".join(report.risk_overview))

@@ -17,6 +17,8 @@ from usstock.admin.app import (
     market_sync_notice_is_ok,
     render_backtest_forms,
     render_discovery_action_row,
+    render_articles_table,
+    render_finnhub_articles_table,
     render_markdown_preview_html,
     render_selected_report,
     render_topic_candidate_actions,
@@ -80,10 +82,10 @@ class AdminReportPreviewTest(unittest.TestCase):
             return_path="/backtest",
         )
 
-        self.assertIn("/actions/market-sync-stooq", html)
+        self.assertIn("/actions/market-sync-yfinance", html)
         self.assertIn("自动同步日线价格", html)
         self.assertIn("从日报候选自动提取 ticker", html)
-        self.assertIn("value=\"stooq\"", html)
+        self.assertIn("value=\"yfinance\"", html)
 
     def test_table_includes_page_size_selector(self) -> None:
         html = table(
@@ -98,6 +100,46 @@ class AdminReportPreviewTest(unittest.TestCase):
         self.assertIn('<option value="20">20</option>', html)
         self.assertIn('<option value="50" selected>50</option>', html)
         self.assertIn('<option value="100">100</option>', html)
+
+    def test_gdelt_articles_table_renders_topic_badges(self) -> None:
+        html = render_articles_table(
+            [
+                {
+                    "title": "AI infrastructure demand rises",
+                    "domain": "example.com",
+                    "language": "English",
+                    "source_country": "US",
+                    "seen_at": None,
+                    "article_url": "https://example.com/news",
+                    "query_text": "ai",
+                    "tone": None,
+                    "topic_slugs": ["ai_infrastructure", "semiconductors"],
+                }
+            ]
+        )
+
+        self.assertIn("<th>主题</th>", html)
+        self.assertIn("ai_infrastructure", html)
+        self.assertIn("semiconductors", html)
+
+    def test_finnhub_articles_table_renders_topic_badges(self) -> None:
+        html = render_finnhub_articles_table(
+            [
+                {
+                    "headline": "Chipmaker expands AI datacenter supply",
+                    "source_name": "Example News",
+                    "category": "general",
+                    "related_tickers": ["NVDA"],
+                    "published_at": None,
+                    "article_url": "https://example.com/finnhub",
+                    "endpoint": "market_news",
+                    "topic_slugs": ["ai_infrastructure"],
+                }
+            ]
+        )
+
+        self.assertIn("<th>主题</th>", html)
+        self.assertIn("ai_infrastructure", html)
 
     def test_admin_token_matching_requires_exact_secret(self) -> None:
         self.assertTrue(admin_token_matches("secret-token", "secret-token"))

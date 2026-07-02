@@ -578,10 +578,10 @@ def build_event_summary(
 ) -> str:
     subject = topic_names[0] if topic_names else (topics[0] if topics else "近期市场主题")
     if titles:
-        return f"{ticker} 进入候选池，主要由“{titles[0]}”触发，事件类型归为{event_type}。"
+        return f"{ticker} 进入短线机会候选，主要由“{titles[0]}”触发，事件类型归为{event_type}。"
     if counts.get("sec_filings", 0):
-        return f"{ticker} 因近期 SEC 公告和 {subject} 主题命中进入候选池，事件类型归为{event_type}。"
-    return f"{ticker} 因 {subject} 相关热度进入候选池，事件类型归为{event_type}。"
+        return f"{ticker} 因近期 SEC 公告和 {subject} 主题命中进入短线机会候选，事件类型归为{event_type}。"
+    return f"{ticker} 因 {subject} 相关热度和个股证据进入短线机会候选，事件类型归为{event_type}。"
 
 
 def build_relation_reason(
@@ -766,7 +766,7 @@ def build_key_events(candidates: tuple[CandidateAnalysis, ...]) -> tuple[str, ..
         tickers = ", ".join(candidate.ticker for candidate in items[:5])
         leader = max(items, key=lambda candidate: candidate.score)
         events.append(
-            f"{topic}：{tickers} 等 {len(items)} 只标的进入候选池，最高分为 {leader.ticker}({leader.score})。"
+            f"{topic}：{tickers} 等 {len(items)} 只标的进入短线机会候选，最高分为 {leader.ticker}({leader.score})。"
         )
     return tuple(events)
 
@@ -777,13 +777,13 @@ def build_executive_summary(
     candidates: tuple[CandidateAnalysis, ...],
 ) -> str:
     if not candidates:
-        return f"{run_date.isoformat()} 暂无候选股进入分析报告。"
+        return f"{run_date.isoformat()} 暂无短线机会候选进入分析报告。"
     leader = candidates[0]
     review_count = sum(1 for candidate in candidates if candidate.attention_label == "优先复核")
     watch_count = sum(1 for candidate in candidates if candidate.attention_label in {"优先复核", "值得关注", "观察"})
     risk_count = sum(1 for candidate in candidates if candidate.risk_level in {"高", "中高"})
     return (
-        f"{run_date.isoformat()} 共生成 {len(candidates)} 只新闻驱动候选股，"
+        f"{run_date.isoformat()} 共生成 {len(candidates)} 只新闻驱动短线机会候选，"
         f"其中 {review_count} 只需要优先复核，{watch_count} 只进入观察范围。"
         f"当前最高分为 {leader.ticker}({leader.score})，主要事件类型为{leader.event_type}。"
         f"高风险或中高风险标的 {risk_count} 只，需先核对原始来源。"
@@ -795,8 +795,8 @@ def build_risk_overview(candidates: tuple[CandidateAnalysis, ...]) -> tuple[str,
         return ("没有候选股时不生成交易观察结论。",)
 
     notes = [
-        "本报告是研究辅助和候选池排序，不构成买卖建议。",
-        "LLM 如被启用，只负责摘要和解释增强，不覆盖结构化评分。",
+        "本报告是研究辅助和短线机会排序，不构成买卖建议。",
+        "LLM 默认用于摘要和解释增强，不覆盖结构化评分；如调用失败则保留规则版报告。",
     ]
     high_risk = [candidate.ticker for candidate in candidates if candidate.risk_level in {"高", "中高"}]
     if high_risk:
@@ -816,8 +816,9 @@ def build_risk_overview(candidates: tuple[CandidateAnalysis, ...]) -> tuple[str,
 def build_methodology_notes() -> tuple[str, ...]:
     return (
         "候选池来自 daily_candidate_scores 和 daily_watchlists，不重新抓取外部数据。",
+        "GDELT 主题新闻只作为板块热度和风向标，只有明确点名 ticker、公司名或公司关键词时才形成个股候选。",
         "事件类型、情绪和风险等级由规则模型基于标题、主题、SEC 计数、流动性分和基本面可用性分生成。",
-        "报告优先使用“值得关注、优先复核、暂缓”等研究表述，不输出直接买入或卖出指令。",
+        "LLM 默认参与生成摘要和风险提示，报告仍优先使用“值得关注、优先复核、暂缓”等研究表述，不输出直接买入或卖出指令。",
     )
 
 
@@ -1180,7 +1181,6 @@ def generate_daily_report(
     run_date: date | None = None,
     profile: str = DEFAULT_PROFILE,
     top_n: int = DEFAULT_TOP_N,
-    use_llm: bool = False,
     llm_model: str | None = None,
     llm_base_url: str | None = None,
     llm_api_key: str | None = None,
@@ -1191,7 +1191,7 @@ def generate_daily_report(
     run_date = run_date or date.today()
     ensure_report_schema(database_url)
     config = llm_config_from_settings(
-        enabled=use_llm,
+        enabled=True,
         model=llm_model,
         base_url=llm_base_url,
         api_key=llm_api_key,
@@ -1264,7 +1264,7 @@ def render_markdown(report: DailyAnalysisReport) -> str:
 
     lines.extend(
         [
-            "## 候选推荐池",
+            "## 短线机会候选",
             "",
             "| 排名 | Ticker | 公司 | 关注级别 | 分数 | 事件 | 情绪 | 风险 | 主题 |",
             "| --- | --- | --- | --- | ---: | --- | --- | --- | --- |",
@@ -1369,7 +1369,6 @@ def add_daily_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-date", help="运行日期，格式 YYYY-MM-DD，默认今天")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help="报告配置名称")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N, help="报告候选股数量")
-    parser.add_argument("--use-llm", action="store_true", help="启用 LLM 增强摘要和风险提示")
     parser.add_argument("--llm-model", help="覆盖 REPORT_LLM_MODEL/LLM_MODEL/OPENAI_MODEL")
     parser.add_argument("--llm-base-url", help="覆盖 REPORT_LLM_BASE_URL/LLM_BASE_URL/OPENAI_BASE_URL")
     parser.add_argument("--llm-api-key", help="覆盖环境变量中的 LLM API key")
@@ -1398,7 +1397,6 @@ def run_from_args(args: argparse.Namespace) -> DailyAnalysisReport:
         run_date=parse_run_date(args.run_date),
         profile=args.profile,
         top_n=args.top_n,
-        use_llm=args.use_llm,
         llm_model=args.llm_model,
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,
