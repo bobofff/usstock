@@ -21,7 +21,6 @@ from usstock.admin.app import (
     render_finnhub_articles_table,
     render_markdown_preview_html,
     render_selected_report,
-    render_weather,
     render_topic_candidate_actions,
     table,
 )
@@ -163,16 +162,6 @@ class AdminReportPreviewTest(unittest.TestCase):
         self.assertIn("app-shell admin-readonly", html)
         self.assertIn("只读浏览", html)
         self.assertIn("window.usstockAdminAccess", html)
-        self.assertIn("天气交易", html)
-
-    def test_render_weather_panel_has_signal_and_sizing_forms(self) -> None:
-        html = render_weather(database_url=None, query={})
-
-        self.assertIn("Polymarket 天气交易", html)
-        self.assertIn('action="/weather"', html)
-        self.assertIn('name="mode" value="signal"', html)
-        self.assertIn('name="mode" value="size"', html)
-        self.assertIn("手动仓位计算", html)
 
     def test_layout_propagates_url_admin_token_to_posts_and_links(self) -> None:
         token = ADMIN_ACCESS_CONTEXT.set(AdminAccess(protected=True, allowed=True))
